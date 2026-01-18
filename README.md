@@ -31,7 +31,7 @@ conda activate hoi2
 
 4. Download additional resources:
    - Download `asset`, `checkpoint`, and `cache` directories from:
-     - [Google Drive](https://dex-ycb.github.io/) (link to be updated)
+     - [Google Drive](https://drive.google.com/drive/folders/1WOch7n3Op9IPN_2Eyd_daWKJ5QH_PC44?usp=sharing)
      - [Baidu Netdisk](https://pan.baidu.com/s/1ubBPkW9jyqf3BFNxWifQ_g?pwd=vpho)
    - Extract the downloaded files:
      - Place `asset` and `checkpoint` directories in the `VPHO` directory
