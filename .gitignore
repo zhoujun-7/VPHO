@@ -216,5 +216,4 @@ __marimo__/
 unit_test*
 nohup.out
 *.jpg
-*.png
 /results
