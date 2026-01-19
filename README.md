@@ -97,6 +97,7 @@ If you find this project useful, please consider citing:
 We thank the following excellent projects:
 
 - [Batch3D](https://github.com/KaifengT/Batch3D)
+- [AmbiguousHPE](https://github.com/GYTuuT/AmbiguousHPE)
 - [HFL](https://github.com/lzfff12/HFL-Net)
 - [DeepSimHO](https://github.com/rongakowang/DeepSimHO)
 - [CPF](https://github.com/lixiny/CPF)
