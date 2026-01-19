@@ -1,4 +1,4 @@
-name: hoi2
+name: vpho
 channels:
   - pytorch
   - nvidia
