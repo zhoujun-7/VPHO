@@ -101,6 +101,7 @@ We thank the following excellent projects:
 - [HFL](https://github.com/lzfff12/HFL-Net)
 - [DeepSimHO](https://github.com/rongakowang/DeepSimHO)
 - [CPF](https://github.com/lixiny/CPF)
+- [GenPose](https://github.com/Jiyao06/GenPose)
 
 ## Contact
 
