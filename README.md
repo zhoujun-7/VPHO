@@ -5,6 +5,8 @@ Official repository for the AAAI 2026 paper [**VPHO: Joint Visual-Physical Cue L
 ## Overview
 
 VPHO is a method for hand-object pose estimation that jointly learns and aggregates visual and physical cues. This repository contains the implementation code and pseudo force data.
+![image](.assets/arch.png)
+![image](.assets/results.png)
 
 ## Prerequisites
 
@@ -23,7 +25,7 @@ cd VPHO
 2. Create the conda environment:
 ```bash
 conda env create -f environment.yaml
-conda activate hoi2
+conda activate vpho
 ```
 
 3. Download the DexYCB dataset:
