@@ -83,14 +83,17 @@ accelerate launch --config_file lib/configs/single.yaml \
 If you find this project useful, please consider citing:
 
 ```bibtex
-@misc{AAAI26-VPHO,
+@article{AAAI26-VPHO, 
     title={VPHO: Joint Visual-Physical Cue Learning and Aggregation for Hand-Object Pose Estimation}, 
-    author={Jun Zhou and Chi Xu and Kaifeng Tang and Yuting Ge and Tingrui Guo and Li Cheng},
-    year={2025},
-    eprint={2511.12030},
-    archivePrefix={arXiv},
-    primaryClass={cs.CV},
-    url={https://arxiv.org/abs/2511.12030}
+    volume={40}, 
+    url={https://ojs.aaai.org/index.php/AAAI/article/view/38375}, 
+    DOI={10.1609/aaai.v40i16.38375},  
+    number={16}, 
+    journal={Proceedings of the AAAI Conference on Artificial Intelligence}, 
+    author={Zhou, Jun and Xu, Chi and Tang, Kaifeng and Ge, Yuting and Guo, Tingrui and Cheng, Li}, 
+    year={2026}, 
+    month={Mar.}, 
+    pages={13683-13691},
 }
 ```
 
