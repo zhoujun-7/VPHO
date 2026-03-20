@@ -1,6 +1,6 @@
 # VPHO
 
-Official repository for the AAAI 2026 paper [**VPHO: Joint Visual-Physical Cue Learning and Aggregation for Hand-Object Pose Estimation**](https://arxiv.org/abs/2511.12030)
+Official repository for the AAAI 2026 paper [**VPHO: Joint Visual-Physical Cue Learning and Aggregation for Hand-Object Pose Estimation**](https://ojs.aaai.org/index.php/AAAI/article/view/38375)
 
 ## Overview
 
