@@ -33,9 +33,9 @@ from lib.utils.misc_fn import (
 from lib.utils.physics_fn import VERT2ANCHOR
 from lib.utils.viz_fn import draw_pts_on_image, draw_bbox_on_image
 from lib.utils.hand_fn import joint_reorder, get_joint_aligned_with_HO3D
-from lib.utils.physics_fn import VERT2ANCHOR
 
-class HO3DDataset_Force(BaseDataset):
+
+class HO3DDataset(BaseDataset):
     def __init__(
         self,
         data_dir: str,
@@ -46,7 +46,6 @@ class HO3DDataset_Force(BaseDataset):
         self.data_dir = data_dir
         super().__init__(is_train, aug, cfg)
         self.load_gravity()
-        self.load_is_grasped()
 
     def load_samples(self, data_dir, is_trainset=True):
         split = "train" if is_trainset else "evaluation"
@@ -73,21 +72,9 @@ class HO3DDataset_Force(BaseDataset):
             return self.dir2gravity[g_key]
         else:
             return np.array([0, 1, 0])
-        
-    def load_is_grasped(self, path="asset/ours/HO3D_v2/is_off_desk.pkl"):
-        with open(path, 'rb') as f:
-            self.is_grasped = pickle.load(f)
-    
-    def get_is_grasped(self, filename):
-        is_g_key = filename.split('/')
-        ind = int(is_g_key[-1])
-        is_g_key = f"{is_g_key[-4]}/{is_g_key[-3]}"
-        v = self.is_grasped[is_g_key]
-        is_grasp = v[ind]
-        return is_grasp
 
     def get_force(self, filename):
-        force_path = filename.replace("HO3D_v2/", "HO3D_v2/cache/hand_force/").replace('.png', '.pkl').replace('rgb/', 'hand_force/')
+        force_path = filename.replace("HO3D_v2/", "HO3D_v2/cache/hand_force/").replace('.jpg', '.pkl').replace('rgb/', 'hand_force/')
         cache_path = os.path.join(self.data_dir, "cache", "hand_force", force_path)
         with open(cache_path, 'rb') as f: force_dt = pickle.load(f)
         force_local = force_dt['force_local']
@@ -167,7 +154,7 @@ class HO3DDataset_Force(BaseDataset):
         )
         force_contact = VERT2ANCHOR.get_force_contact(hand_contact)
         is_grasped = VERT2ANCHOR.check_is_grasped(force_contact)
-        force_local, force_global = self.get_force(rgb_path)
+        # force_local, force_global = self.get_force(sample["color_file"])
 
         # region [get spatial augmentation data]
         center_jittering, scale_factor, rot_factor = self.get_spatial_aug_params(self.is_train)
@@ -260,15 +247,11 @@ class HO3DDataset_Force(BaseDataset):
         cam_intrinsic = torch.from_numpy(cam_intrinsic)
         cam_intrinsic_crop = torch.from_numpy(cam_intrinsic_crop)
         jt3d = torch.from_numpy(jt3d)
-        force_point, _ = VERT2ANCHOR(gt_hand_vert_flip)
-
-        gravity = torch.from_numpy(gravity).to(torch.float32)
 
         # endregion
 
         out = {
             "is_ho3d": True,
-            "index": index,
             "rgb_path": rgb_path,
             "rgb": rgb_tensor,
             "root_joint": root_joint,
@@ -294,7 +277,7 @@ class HO3DDataset_Force(BaseDataset):
             "obj_id": obj_id-1,
             # "obj_kpt3d": obj_kpt3d,
             # "obj_kpt2d": obj_kpt2d,
-            # "obj_verts_cam": obj_verts_cam,
+            "obj_verts_cam": obj_verts_cam,
             "cam_intr": cam_intrinsic,
             "cam_intr_crop": cam_intrinsic_crop,
             "cam_intr_crop_flip": cam_intrinsic_crop_flip,
@@ -303,9 +286,6 @@ class HO3DDataset_Force(BaseDataset):
             "obj_CoM": obj_CoM[None],
             "is_grasped": is_grasped,
             "force_contact": force_contact,
-            "force_local": force_local,
-            "force_global": force_global,
-            "force_point": force_point,
         }
         return out
     
@@ -470,16 +450,13 @@ class HO3DDataset_Force(BaseDataset):
 
             "gravity": np.zeros([1, 3]),
             "obj_CoM": np.zeros([1, 3]),
-            "is_grasped": self.get_is_grasped(sample_path),
+            "is_grasped": True,
             "force_contact": np.zeros([32]),
-            "force_local": np.zeros([32, 3]),
-            "force_global": np.zeros([32, 3]),
-            "force_point": np.zeros([32, 3]),
         }
         return out
     
 
-class HO3DDatasetForce_Train(HO3DDataset_Force):
+class HO3DDataset_Train(HO3DDataset):
     def __init__(
         self,
         data_dir: str,
@@ -500,7 +477,7 @@ class HO3DDatasetForce_Train(HO3DDataset_Force):
     def __getitem__(self, index):
         return self.get_train_item(index)
 
-class HO3DDatasetForce_Valid(HO3DDataset_Force):
+class HO3DDataset_Valid(HO3DDataset):
     def __init__(
         self,
         data_dir: str,
@@ -522,7 +499,7 @@ class HO3DDatasetForce_Valid(HO3DDataset_Force):
     def __getitem__(self, index):
         return self.get_train_item(index)
 
-class HO3DDatasetForce_Test(HO3DDataset_Force):
+class HO3DDataset_Test(HO3DDataset):
     def __init__(
         self,
         data_dir: str,
@@ -531,10 +508,7 @@ class HO3DDatasetForce_Test(HO3DDataset_Force):
     ):
         is_train = False
         super().__init__(data_dir, is_train, aug, cfg)
-        if self.cfg.clean_data_mode != "2023_NIPS_DeepSimHO":
-            self.index_ls = self.load_samples(data_dir)
-        else:
-            self.index_ls = self.load_HO3Dv2_(data_dir)
+        self.index_ls = self.load_samples(data_dir)
 
     def __getitem__(self, index):
         return self.get_eval_item(index)
@@ -550,18 +524,4 @@ class HO3DDatasetForce_Test(HO3DDataset_Force):
             i = i.split("/")
             path = os.path.join(data_dir, "evaluation", i[0], "meta", i[1])
             index_ls.append(path)
-        return index_ls
-    
-    def load_HO3Dv2_(self, data_dir):
-        # load HO3D v2- testset, align with 2023_NIPS_DeepSimHO
-        path = "asset/2023_NIPS_DeepSimHO/cache/HO3D/e154000287d0e832714a8fc8e6a1636b.pkl"
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        b = data['annot_mapping']
-
-        index_ls = []
-        for k, v in b.items():
-            for vv in v:
-                meta_path = os.path.join(data_dir, "evaluation", k, 'meta', f'{vv["frame_idx"]}')
-                index_ls.append(meta_path)
         return index_ls

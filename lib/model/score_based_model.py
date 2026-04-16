@@ -48,8 +48,8 @@ def cond_ode_sampler(
         data,
         prior,
         sde_coeff,
-        atol=3e-4, 
-        rtol=3e-3, 
+        atol=1e-5, 
+        rtol=1e-5, 
         eps=1e-5,
         T=1.0,
         num_steps=None,
@@ -71,7 +71,7 @@ def cond_ode_sampler(
                 score = torch.nan_to_num_(score, nan=0.0, posinf=0.0, neginf=0.0)
         return score.cpu().numpy().reshape((-1,))
     
-    def ode_func(t, x):
+    def ode_func(t, x):      
         """The ODE function for use by the ODE solver."""
         x = torch.tensor(x.reshape(-1, pose_dim), device=device).float()
         time_steps = torch.ones(batch_size, device=device).unsqueeze(-1) * t
@@ -88,7 +88,7 @@ def cond_ode_sampler(
         # num_steps, from T -> eps
         t_eval = np.linspace(T, eps, num_steps)
 
-    res = integrate.solve_ivp(ode_func, (T, eps), init_x.reshape(-1).cpu().numpy(), rtol=rtol, atol=atol, method='RK45', t_eval=t_eval, max_step=10)
+    res = integrate.solve_ivp(ode_func, (T, eps), init_x.reshape(-1).cpu().numpy(), rtol=rtol, atol=atol, method='RK45', t_eval=t_eval)
     xs = torch.tensor(res.y, device=device).T.view(-1, batch_size, pose_dim) # [num_steps, bs, pose_dim]
     x = torch.tensor(res.y[:, -1], device=device).reshape(shape) # [bs, pose_dim]
     # denoise, using the predictor step in P-C sampler

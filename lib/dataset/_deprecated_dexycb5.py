@@ -6,8 +6,8 @@ from natsort import natsorted
 import numpy as np
 import torch
 import cv2
-import yaml
 import tqdm
+from manopth.rodrigues_layer import batch_rodrigues
 from pytorch3d.transforms.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 
 from lib.dataset.base import (BaseDataset,
@@ -25,12 +25,12 @@ from lib.dataset.base import (BaseDataset,
                               normalize_contact,
                               )
 from lib.configs.args import Config
-from lib.utils.transform_fn import project_pt3d_to_pt2d
-from lib.utils.misc_fn import pt2d_to_bbox2d, expand_bbox2d, check_bbox2d, get_rectanglular_bbox2d, get_inter_bbox2d, get_unite_bbox2d
-from lib.utils.physics_fn import VERT2ANCHOR
+from lib.utils.viz_fn import draw_pts_on_image, depth_to_rgb
+from lib.utils.transform_fn import project_pt3d_to_pt2d, rigid_align_AtoB, rigid_transform_3D_AtoB, depth_to_uvd, inverse_project_uvd_to_xyz
+from lib.utils.misc_fn import pt2d_to_bbox2d, expand_bbox2d, check_bbox2d, get_rectanglular_bbox2d
 
 
-class DexYCBDataset_Force(BaseDataset):
+class DexYCBDataset(BaseDataset):
     def __init__(
         self,
         data_dir: str,
@@ -43,8 +43,6 @@ class DexYCBDataset_Force(BaseDataset):
         super().__init__(is_train, cfg, aug)
         self.index_ls = self.load_samples(data_dir)
 
-        self.date2extr, self.date_ls = self.load_cam_extr_dex_ycb()
-        self.date2gravity = self.load_gravity_dex_ycb()
 
     def if_skip_sample(self, sample):
         if self.clean_data_mode == "2023_CVPR_HFL":
@@ -69,18 +67,6 @@ class DexYCBDataset_Force(BaseDataset):
             if not hasattr(self, "__filter_DexYCB_by_steady_grasping"):
                 self.__filter_DexYCB_by_steady_grasping = Filter_DexYCB_by_Steady_Grasping()
             is_skip = not self.__filter_DexYCB_by_steady_grasping(sample)
-        elif self.clean_data_mode == '2023_NIPS_DeepSimHO':
-            if self.is_train:
-                is_skip = not filter_DexYCB_by_HFL(sample)
-            else:
-                if not hasattr(self, "frame_index_DeepSimHO"):
-                    cache_path_DeepSimHO = "asset/2023_NIPS_DeepSimHO/cache/DexYCB/valid.txt"
-                    with open(cache_path_DeepSimHO, "r") as f:
-                        valid_list = f.readlines()
-                    for i, line in enumerate(valid_list):
-                        valid_list[i] = line.strip()
-                    self.frame_index_DeepSimHO = valid_list
-                is_skip = sample['color_file'] not in self.frame_index_DeepSimHO
         else:
             raise NotImplementedError
         return is_skip
@@ -90,13 +76,6 @@ class DexYCBDataset_Force(BaseDataset):
         split = "train" if self.is_train else "test"
         cache_dir = os.path.join(data_dir, "cache", "annotation", split)
         index_path = os.path.join(data_dir, "cache", "annotation", self.clean_data_mode+f"_{split}_index.json")
-
-        # region [tmp]
-        self.tmp = os.path.join(data_dir, "cache", "annotation", "2023_WACV_DMA"+f"_{split}_index.json")
-        with open(self.tmp, "r") as f:
-            self.tmp = json.load(f)
-        # endregion
-
         index_ls = []
         if not os.path.exists(cache_dir) or not os.path.exists(index_path):
             if self.is_train:
@@ -205,73 +184,7 @@ class DexYCBDataset_Force(BaseDataset):
                     -0.3720320463180542,    0.05369240790605545,    0.8496018648147583]],   #! global translation
         'object_seg_file': 'object_render/20200820-subject-03/20200820_135508/836212060125/grasp_object_seg_000001.png'}
     """
-
-    # region [physics]
-    def load_cam_extr_dex_ycb(self):
-        path = f"{self.data_dir}/calibration"
-        f_ls = natsorted(os.listdir(path))
-        date2extr = {}
-        date_ls = []
-        for f in f_ls:
-            if "extrinsic" in f:
-                p = os.path.join(path, f, "extrinsics.yml")
-                with open(p, "r") as file:
-                    date_extr = yaml.load(file, Loader=yaml.FullLoader)
-                date = int(f.split('_')[1])
-
-                for k, v in date_extr["extrinsics"].items():
-                    date_extr["extrinsics"][k] = np.array(v).reshape(3, 4)
-                date2extr[date] = date_extr["extrinsics"]
-                date_ls.append(date)
-
-        date_ls = np.array(date_ls)
-        return date2extr, date_ls
-
-    def load_gravity_dex_ycb(self, path="asset/ours/DexYCB/gravity_direction.json"):
-        with open(path, "r") as f:
-            gravity = json.load(f)
-        date2gravity = {}
-        for k, v in gravity.items():
-            date = k.split('/')[-2]
-            date2gravity[date] = np.array(v)[None]
-        return gravity
-
-    #* has been checked
-    def get_extr_from_filename(self, filename):
-        date = int(filename.split('/')[-3].split('_')[0])
-        sn = filename.split('/')[-2]
-        date_make = (self.date_ls - date) <= 0
-        nearest_date = self.date_ls[date_make].max()
-        extr = self.date2extr[nearest_date][sn]
-        return extr
-    
-    #* has been checked
-    def get_gravity(self, filename):
-        date = filename.split('/')
-        k = date[0] + '/' + date[1] + '/' + "840412060917"
-        gravity = self.date2gravity[k] # (3,)
-        extr = self.get_extr_from_filename(filename)
-        gravity = gravity @ extr[:3, :3]
-        return gravity
-    
-    def get_force(self, filename):
-        force_path = filename.replace("DexYCB/", "DexYCB/cache/hand_force/").replace('.jpg', '.pkl').replace('color_', 'hand_force_')
-        cache_path = os.path.join(self.data_dir, "cache", "hand_force", force_path)
-        with open(cache_path, 'rb') as f: force_dt = pickle.load(f)
-        force_local = force_dt['force_local']
-        force_global = force_dt['force_global']
-        return force_local, force_global
-    # endregion
-
     def __getitem__(self, index):
-
-        # region [tmp]
-        # print(self.index_ls[index])
-        # print(self.tmp[:10])
-        # print(self.index_ls[index] in self.tmp)
-        # exit()
-        # endregion
-
         cache_index = self.index_ls[index] + ".pkl"
         sample = os.path.join(self.cache_dir, cache_index)
         with open(sample, "rb") as f:
@@ -309,11 +222,40 @@ class DexYCBDataset_Force(BaseDataset):
         obj_CoM = YCB_MESHES[obj_name]["CoM"] @ obj_6D[:3, :3].T + obj_6D[:3, 3]
         obj_CoM_z = obj_CoM[2] * 1000 # in mm
 
-        # physics
-        gravity = self.get_gravity(sample["color_file"])
-        gravity = np.array(gravity)
-        
-        hand_contact = self.get_hand_contact(
+         # region [get spatial augmentation data] *checked
+        center_jittering, scale_factor, rot_factor = self.get_spatial_aug_params(self.is_train)
+        rotmat_3d, rotmat_2d, cam_intrinsic_crop = self.get_augmentation_rotmat(center_jittering, scale_factor, rot_factor, jt2d, obj_kpt2d, cam_intrinsic)
+
+            # region [bbox2d] #! make sure bbox in the image
+        rgb_patch = cv2.warpAffine(rgb, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_CUBIC)
+        jt2d = jt2d @ rotmat_2d[:2, :2].T + rotmat_2d[:2, 2]
+        obj_kpt2d = obj_kpt2d @ rotmat_2d[:2, :2].T + rotmat_2d[:2, 2]
+        bbox_hand = pt2d_to_bbox2d(jt2d, mode="x1y1x2y2")
+        bbox_hand = expand_bbox2d(bbox_hand, scale_factor=1.15)
+        bbox_hand, max_wh_hand = get_rectanglular_bbox2d(bbox_hand)
+        is_ok1 = check_bbox2d(bbox_hand, rgb_patch)
+        bbox_obj = pt2d_to_bbox2d(obj_kpt2d, mode="x1y1x2y2")
+        bbox_obj = expand_bbox2d(bbox_obj, scale_factor=1.05)
+        bbox_obj, max_wh_obj = get_rectanglular_bbox2d(bbox_obj)
+        is_ok2 = check_bbox2d(bbox_obj, rgb_patch)
+        if not is_ok1 or not is_ok2:
+            if self.is_train:
+                return self.__getitem__(index)
+            else:
+                cv2.imwrite(f"Tmp_index_{index}.jpg", rgb_patch)
+                raise ValueError("bbox out of image")
+            # endregion
+        # endregion
+
+        obj_depth, obj_depth_back, front_face_map, back_face_map = self.get_obj_front_and_back_depth_map(obj_name, 
+                                                                                                         obj_6D, 
+                                                                                                         cam_intrinsic, 
+                                                                                                         sample["color_file"], 
+                                                                                                         background_val=obj_CoM_z)
+        obj_depth = obj_depth - obj_CoM_z #* change to relative depth, as predition depth in color image is an ill problem
+        obj_depth_back = obj_depth_back - obj_CoM_z
+
+        hand_contact, front_to_joint, front_weight, back_to_joint, back_weight = self.get_hand_and_object_contact(
             mano_pose_aa_flat,
             mano_beta,
             mano_global_rot,
@@ -321,43 +263,13 @@ class DexYCBDataset_Force(BaseDataset):
             is_right,
             obj_name,
             obj_6D,
+            front_face_map,
+            back_face_map,
             sample["color_file"],
         )
         hand_contact = np.clip(hand_contact, 0, 1)
-        force_contact = VERT2ANCHOR.get_force_contact(hand_contact)
-        is_grasped = VERT2ANCHOR.check_is_grasped(force_contact)
-        # is_grasped = self.index_ls[index] in self.tmp
-
-        force_local, force_global = self.get_force(sample["color_file"])
-
-        # region [get spatial augmentation data] *checked
-        center_jittering, scale_factor, rot_factor = self.get_spatial_aug_params(self.is_train)
-        n = 100 # 1.01 ** 100 = 2.7
-        while n:= n - 1:
-            rotmat_3d, rotmat_2d, cam_intrinsic_crop = self.get_augmentation_rotmat(center_jittering, scale_factor, rot_factor, jt2d, obj_kpt2d, cam_intrinsic)
-        # region [bbox2d] #! make sure bbox in the image
-            rgb_patch = cv2.warpAffine(rgb, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_CUBIC)
-            _jt2d = jt2d @ rotmat_2d[:2, :2].T + rotmat_2d[:2, 2]
-            _obj_kpt2d = obj_kpt2d @ rotmat_2d[:2, :2].T + rotmat_2d[:2, 2]
-            bbox_hand = pt2d_to_bbox2d(_jt2d, mode="x1y1x2y2")
-            bbox_hand = expand_bbox2d(bbox_hand, scale_factor=1.15)
-            bbox_hand_rect, max_wh_hand = get_rectanglular_bbox2d(bbox_hand)
-            is_ok1 = check_bbox2d(bbox_hand_rect, rgb_patch)
-            bbox_obj = pt2d_to_bbox2d(_obj_kpt2d, mode="x1y1x2y2")
-            bbox_obj = expand_bbox2d(bbox_obj, scale_factor=1.10)
-            bbox_obj_rect, max_wh_obj = get_rectanglular_bbox2d(bbox_obj)
-            is_ok2 = check_bbox2d(bbox_obj_rect, rgb_patch)
-            if is_ok1 and is_ok2:
-                break
-            else:
-                scale_factor *= 1.01
-        if n == 0:
-            raise ValueError(f"index {index} bbox out of image")
-        jt2d, obj_kpt2d = _jt2d, _obj_kpt2d
-            # endregion
-        # endregion
-
-
+        hand_contact = (hand_contact > 0.1).astype(np.float32)
+        
         # region [do 3D spatial augmentation]  #* checked
         # rot hand 3d. #* checked
         jt3d = jt3d @ rotmat_3d.T
@@ -375,9 +287,15 @@ class DexYCBDataset_Force(BaseDataset):
         obj_kpt3d = YCB_MESHES[obj_name]["kpt3d"] @ obj_6D[:3, :3].T + obj_6D[:3, 3]
         # obj_kpt2d_proj = project_pt3d_to_pt2d(obj_kpt3d, cam_intrinsic) # indentical to obj_kpt2d
         # obj_verts_cam = obj_verts_ori @ obj_6D[:3, :3].T + obj_6D[:3, 3]
+        # endregion
 
-        gravity = gravity @ rotmat_3d.T
-        obj_CoM = obj_CoM @ rotmat_3d.T
+        # region [crop image] #* checked
+        # obj_depth_front_patch = cv2.warpAffine(obj_depth, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_NEAREST)
+        # obj_depth_back_patch = cv2.warpAffine(obj_depth_back, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_NEAREST)
+        # front_to_joint_patch = cv2.warpAffine(front_to_joint, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_NEAREST)
+        # back_to_joint_patch = cv2.warpAffine(back_to_joint, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_NEAREST)
+        # front_weight_patch = cv2.warpAffine(front_weight, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_NEAREST)
+        # back_weight_patch = cv2.warpAffine(back_weight, rotmat_2d[:2, :], (self.cfg.patch_size, self.cfg.patch_size), flags=cv2.INTER_NEAREST)
         # endregion
 
         # region [color augmentation]  #* checked
@@ -388,53 +306,72 @@ class DexYCBDataset_Force(BaseDataset):
         # region [flip left hand]
         gt_hand_vert_flip = gt_hand_vert.copy()
         gt_hand_jt3d_flip = jt3d.copy()
-        cam_intrinsic_crop_flip = cam_intrinsic_crop.copy()
+        gt_hand_vert_flip = gt_hand_vert_flip - gt_hand_jt3d_flip[0]
+        gt_hand_jt3d_flip = gt_hand_jt3d_flip - gt_hand_jt3d_flip[0]
         if not is_right:
             rgb_patch = rgb_patch[:, ::-1].copy()
-
-            jt2d[:, 0] = (rgb_patch.shape[1])  - jt2d[:, 0]
+            jt2d[:, 0] = rgb_patch.shape[1]  - jt2d[:, 0] - 1
 
             gt_hand_jt3d_flip[:, 0] = -gt_hand_jt3d_flip[:, 0]
             gt_hand_vert_flip[:, 0] = -gt_hand_vert_flip[:, 0]
 
-            obj_kpt2d[:, 0] = (rgb_patch.shape[1]) - obj_kpt2d[:, 0]
-            bbox_hand[[0, 2]] = (rgb_patch.shape[1]) - bbox_hand[[2, 0]]
-            bbox_obj[[0, 2]] = (rgb_patch.shape[1]) - bbox_obj[[2, 0]]
-            bbox_hand_rect[[0, 2]] = (rgb_patch.shape[1]) - bbox_hand_rect[[2, 0]]
-            bbox_obj_rect[[0, 2]] = (rgb_patch.shape[1]) - bbox_obj_rect[[2, 0]]
-
-            # gravity[0] = -gravity[0]
-            # obj_CoM[0] = -obj_CoM[0]
+            obj_kpt2d[:, 0] = rgb_patch.shape[1] - obj_kpt2d[:, 0] - 1
+            bbox_hand[[0, 2]] = rgb_patch.shape[1] - bbox_hand[[2, 0]] - 1
+            bbox_obj[[0, 2]] = rgb_patch.shape[1] - bbox_obj[[2, 0]] - 1
 
             mano_pose_aa_mean = mano_pose_aa_mean.reshape(-1, 3)
             mano_pose_aa_mean[:, 1:] *= -1
             mano_pose_aa_mean = mano_pose_aa_mean.reshape(-1)
             mano_global_rot[1:] *= -1
             mano_global_transl[0] *= -1
-            cam_intrinsic_crop_flip[0, 2] = (rgb_patch.shape[1]) - cam_intrinsic_crop_flip[0, 2]
+            cam_intrinsic_flip = cam_intrinsic.copy()
+            cam_intrinsic_flip[0, 2] = rgb.shape[1] - cam_intrinsic_flip[0, 2] - 1
             mano_pose_aa_flat = mano_pose_aa_mean + mano_layer_r.smpl_data["hands_mean"]
-            
+
             #! correct translation  # TODO: correct translation by pa-align
             _, _jt3d = get_hand_vert(mano_pose_aa_flat, mano_beta, mano_global_rot, mano_global_transl, True)
-            mano_global_transl = mano_global_transl + (gt_hand_jt3d_flip[0] - _jt3d[0])
+            mano_global_transl = mano_global_transl + (jt3d.mean(0) - _jt3d.mean(0))
 
         hand_vert, _jt3d = get_hand_vert(mano_pose_aa_flat, mano_beta, mano_global_rot, mano_global_transl, True)
-        
-        gt_hand_vert_flip = gt_hand_vert_flip - gt_hand_jt3d_flip[0]
-        gt_hand_jt3d_flip = gt_hand_jt3d_flip - gt_hand_jt3d_flip[0]
         # endregion
 
         # region [Heatmap]
         #* checked
-        hm_hand = self.adp_hm_hand_generator(jt2d, bbox_hand)
-        hm_obj = self.hm_obj_generator.get_heatmap(obj_kpt2d, bbox_obj_rect, is_right)
-        # endregion
+        # jt2d_hm = jt2d - bbox_hand[:2]
+        # jt2d_hm = jt2d_hm / (max_wh_hand) * (self.cfg.heatmap_size - 1)
+        # hm_hand = self.hm_generator(jt2d_hm)
 
+        # obj_kpt2d_hm = obj_kpt2d - bbox_obj[:2]
+        # obj_kpt2d_hm = obj_kpt2d_hm / (max_wh_obj) * (self.cfg.heatmap_size - 1)
+        # hm_obj = self.hm_generator(obj_kpt2d_hm)
+
+        # TODO: generate hintmap for object center and wrist
+        all_2d_pts = np.concatenate([jt2d, obj_kpt2d], axis=0)
+        bbox_union = pt2d_to_bbox2d(all_2d_pts, mode="x1y1x2y2")
+        bbox_union = expand_bbox2d(bbox_union, scale_factor=1.1)
+        # obj_ct_uv_hm = obj_kpt2d_hm[14]
+        # obj_ct_d = obj_kpt3d[14, 2] - jt3d[0, 2]
+        # wrist_uv_hm = jt2d_hm[0]
+        # endregion
 
         # region [normalization] #TODO: to be checked
         rgb_normalized = normalize_rgb(rgb_patch)
         rgb_tensor = np_to_tensor(rgb_normalized, is_img=True)
-        rgb_tensor = self.image_augmentor.run_random_erasing(rgb_tensor) if self.is_train else rgb_tensor #* checked, random erasing augmentation
+
+        if self.is_train:
+            rgb_tensor = self.image_augmentor.run_random_erasing(rgb_tensor) #* checked, random erasing augmentation
+
+        # front_depth_normalized = normalize_depth(obj_depth_front_patch)
+        # front_depth_tensor = np_to_tensor(front_depth_normalized)
+        # back_depth_normalized = normalize_depth(obj_depth_back_patch)
+        # back_depth_tensor = np_to_tensor(back_depth_normalized)
+        # depth_tensor = torch.stack([front_depth_tensor, back_depth_tensor], dim=0) # (2, H, W)
+
+        # front_contact_normalized = normalize_contact(front_to_joint_patch, front_weight_patch)
+        # front_contact_tensor = np_to_tensor(front_contact_normalized)
+        # back_contact_normalized = normalize_contact(back_to_joint_patch, back_weight_patch)
+        # back_contact_tensor = np_to_tensor(back_contact_normalized)
+        # contact_tensor = torch.stack([front_contact_tensor, back_contact_tensor], dim=0) # (2, 7, H, W)
 
         #! obj pose is never flipped while hand pose is flipped if left hand presented
         root_joint = jt3d[0]
@@ -452,26 +389,17 @@ class DexYCBDataset_Force(BaseDataset):
 
         root_joint_flip = _jt3d[0]
         root_joint_flip = torch.tensor(root_joint_flip, dtype=torch.float32)
-
-        obj_CoM = torch.from_numpy(obj_CoM).to(torch.float32)
-        obj_CoM = obj_CoM - root_joint
-        gravity = torch.from_numpy(gravity).to(torch.float32)
-        force_point, _ = VERT2ANCHOR(gt_hand_vert_flip)
         # endregion
 
         out = {
-            "index": index,
-            "is_ho3d": False,
             "rgb_path": rgb_path,
             "rgb": rgb_tensor,
             "root_joint": root_joint,
             "bbox_hand": bbox_hand,
             "bbox_obj": bbox_obj,
-            "bbox_hand_rect": bbox_hand_rect,
-            "bbox_obj_rect": bbox_obj_rect,
-            
-            "hm_hand": hm_hand,
-            "hm_obj": hm_obj,
+            "bbox_union": bbox_union,
+            # "hm_hand": hm_hand,
+            # "hm_obj": hm_obj,
             "is_right": is_right,
             "gt_jt2d": jt2d,
             "gt_obj2d": obj_kpt2d,
@@ -484,18 +412,22 @@ class DexYCBDataset_Force(BaseDataset):
             "gt_hand_vert_flip": gt_hand_vert_flip, # flipped, for supervision
             "root_joint_flip": root_joint_flip,
             "obj_name": obj_name,
-            "obj_id": obj_id-1,
             "cam_intr": cam_intrinsic,
             "cam_intr_crop": cam_intrinsic_crop,
-            "cam_intr_crop_flip": cam_intrinsic_crop_flip,
+            "gt_hand_contact": hand_contact,
 
-            "gravity": gravity[None],
-            "obj_CoM": obj_CoM[None],
-            "is_grasped": is_grasped,
-            "force_contact": force_contact,
-            "force_local": force_local,
-            "force_global": force_global,
-            "force_point": force_point,
+            # "gt_mano": torch.tensor(mano_params, dtype=torch.float32),
+            # "gt_hand_transl": torch.tensor(mano_global_transl, dtype=torch.float32),
+            # 'gt_jt3d': torch.tensor(jt3d, dtype=torch.float32),
+            # 'gt_hand_vert': torch.tensor(hand_vert, dtype=torch.float32),
+            # "depth": depth_tensor,
+            # "contact": contact_tensor,
+            # "bbox_mask_unite": bbox_mask_unite,
+            # "bbox_mask_inter": bbox_mask_inter,
+            # "cam_intrinsic": cam_intrinsic,
+            # "obj_id": obj_id,
+            # "obj_name": obj_name,
+            # "hand_contact": hand_contact,
         }
         return out
 

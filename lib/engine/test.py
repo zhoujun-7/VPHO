@@ -151,7 +151,6 @@ def get_symmetry_transformations(model_info, max_sym_disc_step):
 
 
 # from 2024-CVPR-HOISDF
-@torch.no_grad()
 def compute_obj_metrics_dexycb(pred_meshes, target_meshes):
     B, N, _ = pred_meshes.shape
     add_gt = target_meshes.unsqueeze(1).repeat(1, N, 1, 1)
@@ -226,6 +225,7 @@ class TesterObject:
         self.t = np.stack(t)  # [N, max_sym_len, 3, 1]
         # endregion
 
+
     def __call__(self, data):
         """ data: {
             'pd_rt': (N, ..., 3, 4),
@@ -240,13 +240,6 @@ class TesterObject:
 
         length = data['gt_rt'].shape[0]
         MCE, MCE2, SMCE, OCE, ADD, ADDS, ADD01d, ADDS01d, REP, REP5 = [], [], [], [], [], [], [], [], [], []
-
-        # ===== 新增：F-score（多阈值）与 Chamfer 距离收集容器 =====
-        FSCORE_KEYS = ["FSCORE@2mm", "FSCORE@5mm", "FSCORE@10mm", "FSCORE@2cm", "FSCORE@5cm", "FSCORE@10cm"]
-        FSCORE = {k: [] for k in FSCORE_KEYS}
-        CD = []
-        # ======================================================
-
         for i in range(length):
             pd_rt = data['pd_rt'][i]
             gt_rt = data['gt_rt'][i]
@@ -259,13 +252,6 @@ class TesterObject:
             add, adds, rep = self.criterion_ADD_REP(pd_rt, gt_rt, obj_name, cam_intr)
             add01d, adds01d = self.cal_ADD01d(add, adds, obj_name)
             rep5 = self.cal_REP5(rep)
-
-            # ===== 新增：F-score 与 Chamfer 距离 =====
-            fscore_dict, cd = self.criterion_FSCORE(pd_rt, gt_rt, obj_name)
-            for k in FSCORE_KEYS:
-                FSCORE[k].append(fscore_dict[k])
-            CD.append(cd)
-            # ======================================
 
             MCE.append(mce)
             MCE2.append(mce2)
@@ -289,49 +275,31 @@ class TesterObject:
         REP = np.stack(REP, axis=0)
         REP5 = np.stack(REP5, axis=0)
 
-        # 新增：堆叠 FSCORE 与 CD
-        CD = np.stack(CD, axis=0)
-        for k in FSCORE_KEYS:
-            FSCORE[k] = np.stack(FSCORE[k], axis=0)
-
         MCE_dt, MCE2_dt, SMCE_dt, OCE_dt, ADD_dt, ADDS_dt, ADD01d_dt, ADDS01d_dt, REP_dt, REP5_dt = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-        # 新增
-        FSCORE_dt = {k: {} for k in FSCORE_KEYS}
-        CD_dt = {}
-
         for k in YCB_MESHES.keys():
             if k == '051_large_clamp':
                 continue
-            sel = data['obj_name'] == k
-            MCE_dt[k] = MCE[sel]
-            MCE2_dt[k] = MCE2[sel]
-            # SMCE_dt[k] = SMCE[sel]
-            OCE_dt[k] = OCE[sel]
-            ADD_dt[k] = ADD[sel]
-            ADDS_dt[k] = ADDS[sel]
-            ADD01d_dt[k] = ADD01d[sel]
-            ADDS01d_dt[k] = ADDS01d[sel]
-            REP_dt[k] = REP[sel]
-            REP5_dt[k] = REP5[sel]
-            # 新增
-            for kk in FSCORE_KEYS:
-                FSCORE_dt[kk][k] = FSCORE[kk][sel]
-            CD_dt[k] = CD[sel]
+            MCE_dt[k] = MCE[data['obj_name'] == k]
+            MCE2_dt[k] = MCE2[data['obj_name'] == k]
+            # SMCE_dt[k] = SMCE[data['obj_name'] == k]
+            OCE_dt[k] = OCE[data['obj_name'] == k]
+            ADD_dt[k] = ADD[data['obj_name'] == k]
+            ADDS_dt[k] = ADDS[data['obj_name'] == k]
+            ADD01d_dt[k] = ADD01d[data['obj_name'] == k]
+            ADDS01d_dt[k] = ADDS01d[data['obj_name'] == k]
+            REP_dt[k] = REP[data['obj_name'] == k]
+            REP5_dt[k] = REP5[data['obj_name'] == k]
 
-        # 注意：average_instance 放在循环外，避免覆盖
-        MCE_dt['average_instance'] = MCE
-        MCE2_dt['average_instance'] = MCE2
-        # SMCE_dt['average_instance'] = SMCE
-        OCE_dt['average_instance'] = OCE
-        ADD_dt['average_instance'] = ADD
-        ADDS_dt['average_instance'] = ADDS
-        ADD01d_dt['average_instance'] = ADD01d
-        ADDS01d_dt['average_instance'] = ADDS01d
-        REP_dt['average_instance'] = REP
-        REP5_dt['average_instance'] = REP5
-        for kk in FSCORE_KEYS:
-            FSCORE_dt[kk]['average_instance'] = FSCORE[kk]
-        CD_dt['average_instance'] = CD
+            MCE_dt['average_instance'] = MCE
+            MCE2_dt['average_instance'] = MCE2
+            # SMCE_dt['average_instance'] = SMCE
+            OCE_dt['average_instance'] = OCE
+            ADD_dt['average_instance'] = ADD
+            ADDS_dt['average_instance'] = ADDS
+            ADD01d_dt['average_instance'] = ADD01d
+            ADDS01d_dt['average_instance'] = ADDS01d
+            REP_dt['average_instance'] = REP
+            REP5_dt['average_instance'] = REP5
 
         res_dt = {
             'MCE': MCE_dt,
@@ -343,11 +311,7 @@ class TesterObject:
             'ADD01d': ADD01d_dt,
             'ADDS01d': ADDS01d_dt,
             'REP': REP_dt,
-            # 新增
-            'CD': CD_dt,  # Chamfer-L2 (m)
         }
-        # 把各个 FSCORE@* 合并进入结果
-        res_dt.update({kk: FSCORE_dt[kk] for kk in FSCORE_KEYS})
 
         return res_dt
 
@@ -416,7 +380,7 @@ class TesterObject:
         _, mce = compute_obj_metrics_dexycb(pd_verts_pt, gt_verts_pt)
         return mce[0].numpy()
 
-    @torch.no_grad()
+
     def criterion_ADD_REP(self, pd_rt, gt_rt, obj_name, cam_intr):
         """
             Args:
@@ -431,6 +395,7 @@ class TesterObject:
             obj_vert = self.obj_mesh[obj_name]['verts_sampled']
         else:
             obj_vert = self.obj_mesh[obj_name]['verts']
+
 
         pd_verts = np.einsum("ni,...ij->...nj", obj_vert, pd_rt[..., :3].swapaxes(-1, -2)) + pd_rt[..., 3][..., None, :]
         gt_verts = np.einsum("ni,ij->nj", obj_vert, gt_rt[:, :3].swapaxes(-1, -2)) + gt_rt[:, 3][None, :]
@@ -448,59 +413,6 @@ class TesterObject:
         rep = np.linalg.norm(pd_vert_proj - gt_vert_proj, axis=-1).mean(-1)
 
         return add, adds, rep
-
-    @torch.no_grad()
-    def criterion_FSCORE(self, pd_rt, gt_rt, obj_name, th_list=None):
-        """
-        Args:
-            pd_rt: (..., 3, 4)
-            gt_rt: (3, 4)
-            th_list: list[float] in meters (default: [2mm, 5mm, 10mm, 2cm, 5cm, 10cm])
-        Returns:
-            fscore_dict: { 'FSCORE@2mm': (...,), 'FSCORE@5mm': (...,), ... }
-            cd: (...,)  # Chamfer-L2 (non-squared), meters
-        """
-        if th_list is None:
-            th_list = [0.002, 0.005, 0.010, 0.020, 0.050, 0.100]
-
-        if use_sampled_vertices := False:
-            obj_vert = self.obj_mesh[obj_name]['verts_sampled']
-        else:
-            obj_vert = self.obj_mesh[obj_name]['verts']
-
-        pd_verts = np.einsum("ni,...ij->...nj", obj_vert, pd_rt[..., :3].swapaxes(-1, -2)) + pd_rt[..., 3][..., None, :]
-        gt_verts = np.einsum("ni,ij->nj", obj_vert, gt_rt[:, :3].swapaxes(-1, -2)) + gt_rt[:, 3][None, :]
-
-        pd_verts_pt = torch.from_numpy(pd_verts).float().cuda()  # (..., P, 3)
-        gt_verts_pt = torch.from_numpy(gt_verts).float().cuda()  # (Q, 3)
-
-        if pd_verts_pt.ndim == 2:
-            pd_verts_pt = pd_verts_pt.unsqueeze(0)  # (1, P, 3)
-        gt_verts_pt = gt_verts_pt.unsqueeze(0).expand(pd_verts_pt.size(0), -1, -1)  # (B, Q, 3)
-
-        dmat = torch.cdist(pd_verts_pt, gt_verts_pt)  # (B, P, Q)
-        d_pred2gt, _ = dmat.min(dim=2)  # (B, P)
-        d_gt2pred, _ = dmat.min(dim=1)  # (B, Q)
-
-        # Chamfer-L2 (non-squared)
-        cd = 0.5 * (d_pred2gt.mean(dim=1) + d_gt2pred.mean(dim=1))  # (B,)
-
-        eps = 1e-6
-        fscore_dict = {}
-        for th in th_list:
-            precision = (d_pred2gt < th).float().mean(dim=1)
-            recall    = (d_gt2pred < th).float().mean(dim=1)
-            fscore    = (2 * precision * recall) / (precision + recall + eps)
-
-            # 阈值标签：<= 10mm 都用 mm，其他用 cm；用 round 防止 0.0100000002 这类浮点误差
-            if th <= 0.010 + 1e-9:
-                tag = f"FSCORE@{int(round(th * 1000))}mm"   # 2/5/10 mm -> 2/5/10
-            else:
-                tag = f"FSCORE@{int(round(th * 100))}cm"    # 2/5/10 cm -> 2/5/10
-            fscore_dict[tag] = fscore.detach().cpu().numpy()
-
-
-        return fscore_dict, cd.detach().cpu().numpy()
     
     def cal_ADD01d(self, add, adds, obj_name):
         """
@@ -525,62 +437,42 @@ class TesterObject:
         post_dt = {}
         for k, v in res_dt.items():
             tmp_dt = {}
-            class_vals = []
-
+            avg, i, all_ls = 0, 0, []
             for kk, vv in v.items():
-                if vv.shape[0] == 0:
-                    continue
-
-                if not is_multihyper:
-                    val = vv.mean()
-                    stacked_for_avg = vv
-                else:
-                    # 多超参：选择更优的那一条
-                    if k in ['MCE', 'MCE2', 'SMCE', 'OCE', 'ADD', 'ADDS', 'CD', 'REP']:
-                        best = vv.min(-1)        # 距离/误差类 越小越好
-                        val = best.mean(-1)
-                        stacked_for_avg = best
-                    elif k in ['ADD01d', 'ADDS01d', 'REP5'] or k.startswith('FSCORE@'):
-                        best = vv.max(-1)        # 准确率/命中率类 越大越好
-                        val = best.mean(-1)
-                        stacked_for_avg = best
+                if vv.shape[0] > 0:
+                    if not is_multihyper:
+                        tmp_dt[kk] = vv.mean()
+                        all_ls.append(vv)
                     else:
-                        val = vv.mean(-1)
-                        stacked_for_avg = vv
-
-                tmp_dt[kk] = val
-                if kk != 'average_instance':
-                    class_vals.append(stacked_for_avg)
-
-            # 类均值（各类别/实例的聚合）
-            if len(class_vals) > 0:
-                concat_for_class = np.concatenate(class_vals)
-                tmp_dt['average_class'] = concat_for_class.mean()
-                tmp_dt['average_instance'] = concat_for_class.mean()
-            else:
-                tmp_dt['average_class'] = np.nan
-                tmp_dt['average_instance'] = np.nan
-
+                        if k in ['MCE', 'MCE2', 'SMCE', 'OCE', 'ADD', 'ADDS', 'REP']:
+                            best = vv.min(-1)
+                        elif k in ['ADD01d', 'ADDS01d', 'REP5']:
+                            best = vv.min(-1)
+                        tmp_dt[kk] = best.mean(-1)
+                        all_ls.append(best)
+                    avg += tmp_dt[kk]
+                    i += 1
+            avg /= i
+            tmp_dt['average_class'] = avg
+            all_ls = np.concatenate(all_ls)
+            tmp_dt['average_instance'] = all_ls.mean()
             post_dt[k] = tmp_dt
-
         out_dt = self.format(post_dt)
         return out_dt
     
+
     def format(self, post_dt):
         for k, v in post_dt.items():
             for kk, vv in v.items():
-                if k in ['MCE', 'MCE2', 'SMCE', 'OCE', 'ADD', 'ADDS', 'CD']:
-                    # 距离（m -> mm），保留 2 位小数（向下截断）
+                if k in ['MCE', 'MCE2', 'SMCE', 'OCE', 'ADD', 'ADDS']:
                     v[kk] = int(vv*100000) / 100 if np.isfinite(vv) else vv # to mm
-                elif k in ['ADD01d', 'ADDS01d', 'REP5'] or k.startswith('FSCORE@'):
-                    # 百分比，保留 2 位小数（向下截断）
+                elif k in ['ADD01d', 'ADDS01d', 'REP5']:
                     v[kk] = int(vv*10000) / 100 if np.isfinite(vv) else vv # to percent
                 elif k in ['REP']:
-                    # 像素
                     v[kk] = int(vv*100) / 100 if np.isfinite(vv) else vv # to pixel
                 
         return post_dt
-
+    
 
 class TesterHand:
     def __init__(self):
@@ -600,31 +492,24 @@ class TesterHand:
                 data = pickle.load(f)
 
         length = data['gt_joint'].shape[0]
-        IS_RIGHT, MJE, PA_MJE, JE, MVE, PAMVE = [], [], [], [], [], []
+        IS_RIGHT, MJE, PA_MJE, JE = [], [], [], []
         for i in range(length):
             gt_joint = data['gt_joint'][i]
             pd_joint = data['pd_joint'][i]
             is_right = data['is_right'][i]
-            gt_vert = data['gt_vert'][i]
-            pd_vert = data['pd_vert'][i]
 
-            mje, pa_mje, je = self.criterion_MJE_PAMJE(gt_joint, pd_joint)
-            mve, pa_mve, _ = self.criterion_MJE_PAMJE(gt_vert, pd_vert)
+            mje, pa_mje, je = self.criterion_MJE_PA_MJE(gt_joint, pd_joint)
             IS_RIGHT.append(is_right)
             MJE.append(mje)
             PA_MJE.append(pa_mje)
             JE.append(je)
-            MVE.append(mve)
-            PAMVE.append(pa_mve)
 
         IS_RIGHT = np.stack(IS_RIGHT, axis=0)
         MJE = np.stack(MJE, axis=0)
         PA_MJE = np.stack(PA_MJE, axis=0)
         JE = np.stack(JE, axis=0)
-        MVE = np.stack(MVE, axis=0)
-        PAMVE = np.stack(PAMVE, axis=0)
 
-        MJE_dt, PA_MJE_dt, JE_dt, MVE_dt, PAMVE_dt = {}, {}, {}, {}, {}
+        MJE_dt, PA_MJE_dt, JE_dt = {}, {}, {}
         MJE_dt['right'] = MJE[IS_RIGHT]
         MJE_dt['left'] = MJE[~IS_RIGHT]
         MJE_dt['both'] = MJE
@@ -634,12 +519,6 @@ class TesterHand:
         JE_dt['right'] = JE[IS_RIGHT]
         JE_dt['left'] = JE[~IS_RIGHT]
         JE_dt['both'] = JE
-        MVE_dt['right'] = MVE[IS_RIGHT]
-        MVE_dt['left'] = MVE[~IS_RIGHT]
-        MVE_dt['both'] = MVE
-        PAMVE_dt['right'] = PAMVE[IS_RIGHT]
-        PAMVE_dt['left'] = PAMVE[~IS_RIGHT]
-        PAMVE_dt['both'] = PAMVE
 
         JE_split_dt = {}
         for i in range(21):
@@ -648,13 +527,11 @@ class TesterHand:
         res_dt = {
             'MJE': MJE_dt,
             'PA_MJE': PA_MJE_dt,
-            'MVE': MVE_dt,
-            'PAMVE': PAMVE_dt,
         }
         res_dt.update(JE_split_dt)
         return res_dt
     
-    def criterion_MJE_PAMJE(self, gt_joint, pd_joint):
+    def criterion_MJE_PA_MJE(self, gt_joint, pd_joint):
         """
             Args:
                 gt_joint: (21, 3)
@@ -678,3 +555,4 @@ class TesterHand:
         pa_mje = np.linalg.norm(gt_joint - pd_joint_aligned, axis=-1).mean(-1)
         return mje, pa_mje, je
     
+

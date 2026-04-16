@@ -15,28 +15,22 @@ class HeadObject(nn.Module):
             kpt3d = YCB_MESHES[k]['kpt3d']
             kpt3d = torch.from_numpy(kpt3d).float()
             self.register_buffer(f"point_{k}", kpt3d)
-            
             shift = YCB_MESHES[k]['shift']
             shift = torch.tensor(shift).float()
             # self.register_buffer(f"shift_{k}", shift)  # TODO: use axsym
-            
             vert3d = YCB_MESHES[k]['verts_sampled']
             vert3d = torch.from_numpy(vert3d).float()
             self.register_buffer(f"vert_{k}", vert3d)
-
             CoM = YCB_MESHES[k]['CoM']
             CoM = torch.tensor(CoM).float()[None]
             self.register_buffer(f"CoM_{k}", CoM)
 
-            vert3d = YCB_MESHES[k]['verts']
-            vert3d = torch.from_numpy(vert3d).float()
-            self.register_buffer(f"vert_full_{k}", vert3d)
 
 
     def forward(self, pose, name, data_name='keypoint'):
         """ pose: (bs, ..., 9)
             name: (bs, )
-            data_name: in ['keypoint', 'verts', 'CoM', 'verts_full]
+            data_name: in ['keypoint', 'verts', 'CoM']
         """
         pts_ls = []
         for n in name:
@@ -45,8 +39,6 @@ class HeadObject(nn.Module):
                 vert = getattr(self, f"point_{n}")
             elif data_name == 'verts':
                 vert = getattr(self, f"vert_{n}")
-            elif data_name == 'verts_full':
-                vert = getattr(self, f"vert_full_{n}")
             elif data_name == 'CoM':
                 vert = getattr(self, f"CoM_{n}")
             else:

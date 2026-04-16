@@ -130,4 +130,3 @@ def make_heatmaps(image, heatmaps):
     image_grid[:, 0:width, :] = image_resized
 
     return image_grid
-    

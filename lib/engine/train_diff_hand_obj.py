@@ -2,26 +2,42 @@ import os
 import cv2
 import json
 from tqdm.auto import tqdm
+import time
 import torch
 import pickle
 import pprint
 import numpy as np
 import pandas as pd
+import collections
 from copy import copy, deepcopy
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
+from collections import defaultdict
+from pytorch3d.transforms.rotation_conversions import matrix_to_rotation_6d, rotation_6d_to_matrix
 
 from lib.engine.base_trainer import BaseTrainer
-from lib.model.VPHO import vpho_net
+
+from lib.model.net12 import DiffHandObj
+from lib.model.net14 import DiffHandObj_RegForce
+from lib.model.net12_multi_bbx import DiffHandObj_MultiBBox
+from lib.model.net12_MultiBBox_HM128 import DiffHandObj_MultiBBox_HM128
+from lib.model.net15_BBox_Force import DiffHandObj_BBox_Force
+
 from lib.model.physics import from_local_to_global
 from lib.configs.args import Config
+from lib.dataset.dexycb5_multi_bbx import DexYCBDataset
 from lib.dataset.dexycb6 import DexYCBDataset_Force
-from lib.dataset.base import inverse_normalize_rgb
+from lib.dataset.base import inverse_normalize_rgb, dep_to_3channel, tensor_to_np
 from lib.utils.misc_fn import to_device, to_numpy, to_tensor
+from lib.utils.hand_fn import get_mean_joint_error, get_pa_mean_joint_error
 from lib.utils.transform_fn import obj_9D_to_mat, obj_mat_to_9D, OPENGL_TO_OPENCV
 from lib.engine.test import TesterObject, TesterHand
-from lib.dataset.base import YCB_MESHES, mano_layer_r
-from lib.utils.viz_fn import get_random_color, make_heatmaps, depth_to_rgb
+from lib.engine.test_physics import TesterPhysics
+from lib.dataset.base import YCB_MESHES
+from lib.utils.viz_fn import get_color_bar, get_random_color, make_heatmaps, depth_to_rgb
+from lib.utils.physics_fn import VERT2ANCHOR
+from lib.utils.viz_fn import draw_pts_on_image
+from lib.utils.transform_fn import project_pt3d_to_pt2d
 
 
 class Trainer(BaseTrainer):
@@ -29,10 +45,19 @@ class Trainer(BaseTrainer):
         super(Trainer, self).__init__(cfg)
         self.tester_obj = TesterObject()
         self.tester_hand = TesterHand()
+        self.tester_physics = TesterPhysics()
 
     def get_model(self):
-        if self.cfg.model == 'vpho_net':
-            self.model = vpho_net()
+        if self.cfg.model == 'DiffHandObj':
+            self.model = DiffHandObj()
+        elif self.cfg.model == 'DiffHandObj_RegForce':
+            self.model = DiffHandObj_RegForce()
+        elif self.cfg.model == 'DiffHandObj_MultiBBox':
+            self.model = DiffHandObj_MultiBBox()
+        elif self.cfg.model == 'DiffHandObj_MultiBBox_HM128':
+            self.model = DiffHandObj_MultiBBox_HM128()
+        elif self.cfg.model == 'DiffHandObj_BBox_Force':
+            self.model = DiffHandObj_BBox_Force()
         else:
             raise ValueError(f"Invalid model name: {self.cfg.model}")
 
@@ -93,7 +118,6 @@ class Trainer(BaseTrainer):
                 pin_memory=True,
                 drop_last=True,
             )
-
             self.testing_dataloader = DataLoader(
                 self.testset,
                 batch_size=self.cfg.eval_batch_size,
@@ -102,17 +126,15 @@ class Trainer(BaseTrainer):
                 pin_memory=False,
                 drop_last=False,
             )
-            sub_index = np.arange(0, len(self.testset), 10)
+            sub_index = np.arange(0, len(self.testset), 6)
             sub_testset = Subset(self.testset, sub_index)
-            self.trainset.is_train = False
             self.sub_testing_dataloader = DataLoader(
                 sub_testset,
                 batch_size=self.cfg.eval_batch_size,
-                shuffle=True,
+                shuffle=False,
                 num_workers=self.cfg.eval_num_workers,
                 pin_memory=False,
                 drop_last=False,
-                generator=torch.Generator().manual_seed(128),
             )
         
         else:
@@ -129,8 +151,6 @@ class Trainer(BaseTrainer):
         if self.cfg.start_with_eval:
             if self.cfg.dataset_name == 'dexycb':
                 self.evaluate(self.sub_testing_dataloader)
-            elif self.cfg.dataset_name == 'ho3d':
-                self.infer()
             else:
                 raise NotImplementedError
             
@@ -142,14 +162,12 @@ class Trainer(BaseTrainer):
             self.train_one_epoch(epoch)
             self.save_checkpoint(epoch+1)
 
+            # if (epoch+1) % self.cfg.full_evaluation_freq == 0:
+            #     self.logger.info(f"Evaluation on test dataset: {len(self.testing_dataloader.dataset)}", main_process_only=True)
+            #     self.evaluate(self.testing_dataloader)
+            # else:
             self.logger.info(f"Evaluation on subtest dataset: {len(self.sub_testing_dataloader.dataset)}", main_process_only=True)
-            if self.cfg.dataset_name != 'ho3d':
-                self.evaluate(self.sub_testing_dataloader) 
-            elif self.cfg.dataset_name == 'ho3d':
-                if (epoch+1) % self.cfg.full_evaluation_freq == 0:
-                    if self.cfg.use_mix_trainset:
-                        self.evaluate(self.sub_testing_dataloader) 
-                    self.infer(epoch+1)
+            self.evaluate(self.sub_testing_dataloader) 
             self.save_model()
 
     def eval(self,):
@@ -158,11 +176,9 @@ class Trainer(BaseTrainer):
         
         if self.cfg.dataset_name == 'dexycb':
             if self.cfg.eval_full:
-                self.evaluate(self.testing_dataloader)
-            else:
+            #     self.evaluate(self.testing_dataloader)
+            # else:
                 self.evaluate(self.sub_testing_dataloader)
-        elif self.cfg.dataset_name == 'ho3d':
-            self.infer()
         else:
             raise NotImplementedError
 
@@ -188,7 +204,7 @@ class Trainer(BaseTrainer):
                     info += "| Loss"
                     # TODO: reduce loss_dt
                     for c, (k, v) in enumerate(loss_dt.items()):
-                        info += f" {k.replace('_loss', '').replace('hand', 'H').replace('obj', 'O').replace('reg', 'R')}:{v.item():.2e}"
+                        info += f" {k.replace('_loss', '').replace('hand', 'H').replace('obj', 'O')}:{v.item():.2e}"
 
                 if i % self.cfg.print_freq == 0:
                     if self.accel.is_main_process: print('\r', end='')
@@ -211,63 +227,65 @@ class Trainer(BaseTrainer):
         collector_physics = []
         collector_res = []
         for i, batch in enumerate(pbar):
-
-            # if i == 10:
-            #     break
             to_device(batch, self.device)
             self.accel.wait_for_everyone() #! Even if the model is in eval mode, it is necessary to synchronize the model, otherwise the other processes will be very slow.
-            
-            if i == 0:
-                compute_flops(self.model, batch)
-            
             res_dt = self.model(batch, mode='predict')
             res_dt = self.postprocess(res_dt, batch['root_joint'], batch['is_right'])
             batch = self.postprocess(batch, batch['root_joint'])
             res_dt = to_numpy(res_dt)
             batch = to_numpy(batch)
-            
-
-            hand_data = res_dt['agg_hand_mano']
-            obj_data = res_dt['agg_obj_rt']
-            data_path = batch['rgb_path']
-            
-            res_dt = to_numpy(res_dt)
-            batch = to_numpy(batch)
-
             eval_hand_dt = {
                 'is_right': batch['is_right'],
                 'gt_joint': batch['gt_joint'],
                 'gt_vert': batch['gt_hand_vert'],
-                'pd_vert_reg': res_dt['reg_hand_vert'],
-                'pd_joint_reg': res_dt['reg_hand_joint'],
-                'pd_vert_diff_final': res_dt['diff_final_hand_vert'],
-                'pd_joint_diff_final': res_dt['diff_final_hand_joint'],
-                'pd_vert_diff_agg': res_dt['agg_hand_vert'],
-                'pd_joint_diff_agg': res_dt['agg_hand_joint'],
+                'pd_vert_reg': res_dt['hand_vert'],
+                'pd_joint_reg': res_dt['hand_joint'],
+                'pd_vert_diff': res_dt['final_hand_vert'],
+                'pd_joint_diff': res_dt['final_hand_joint'],
+                'pd_vert_diff_mean': res_dt['mean_hand_vert'],
+                'pd_joint_diff_mean': res_dt['mean_hand_joint'],
             }
             collector_hand.append(self.test_diff_hand(eval_hand_dt, is_eval_best=False))
             eval_obj_dt = {
-                'pd_rt': res_dt['diff_final_obj_rt'],
+                'pd_rt': res_dt['obj_final_rt'],
                 'gt_rt': batch['gt_obj_rt'],
                 'cam_intr': batch['cam_intr'],
                 'obj_name': batch['obj_name'],
-                'pd_rt_agg': res_dt['agg_obj_rt'],
+                'pd_rt_mean': res_dt['obj_mean_rt'],
             }
-            if 'reg_obj_rt' in res_dt:
-                eval_obj_dt['pd_rt_reg'] = res_dt['reg_obj_rt']
             collector_obj.append(self.test_diff_object(eval_obj_dt, is_eval_best=False))
 
             pd_res_dt = {
                 'index': batch['index'],
                 'path': batch['rgb_path'],
-                'pd_obj_rt': res_dt['agg_obj_rt'],
-                'pd_hand_vert': res_dt['agg_hand_vert'].astype(np.float16),
-                'pd_hand_joint': res_dt['agg_hand_joint'],
-                'gt_obj_rt': batch['gt_obj_rt'],
-                'obj_name': batch['obj_name'],
+                'pd_obj_rt': res_dt['obj_mean_rt'],
+                'pd_hand_vert': res_dt['mean_hand_vert'].astype(np.float16),
+                'pd_hand_joint': res_dt['mean_hand_joint'],
             }
             collector_res.append(pd_res_dt)
 
+            # eval_force_dt = {
+            #     'force_blance': res_dt['force_blance'],
+            #     'gravity_blance': res_dt['gravity_blance'],
+            #     'torque_blance': res_dt['torque_blance'],
+            #     # 'point': res_dt['point'],
+            # }
+            # collector_force.append(eval_force_dt)
+            # if self.cfg.eval_physics:
+            #     eval_phy_dt = {
+            #         'pd_hand_vert': res_dt['mean_hand_vert'],
+            #         'gt_hand_vert': batch['gt_hand_vert'],
+            #         'pd_obj_rt': res_dt['obj_mean_rt'],
+            #         'gt_obj_rt': batch['gt_obj_rt'],
+            #         'pd_force_local': res_dt['force_local'],
+            #         'gravity': batch['gravity'],
+            #         'obj_name': batch['obj_name'],
+            #     }
+            #     collector_physics.append(self.tester_physics(eval_phy_dt))
+
+            is_right = batch['is_right']
+            pd_t = res_dt['obj_mean_rt'][:, :, 3]
+            gt_t = batch['gt_obj_rt'][:, :, 3]
 
             if self.cfg.viz_freq > 0:
                 if testing_dataloader == self.sub_testing_dataloader:
@@ -281,19 +299,20 @@ class Trainer(BaseTrainer):
                         rgb_path=batch['rgb_path'],
                         obj_name=batch['obj_name'],
                         gt_vert=batch['gt_hand_vert'],
-                        pd_vert_reg=res_dt['reg_hand_vert'],
-                        pd_vert_diff_final=res_dt['diff_final_hand_vert'],
-                        pd_vert_diff_inprocess=res_dt['diff_inprocess_hand_vert'],
-                        pd_vert_diff_agg=res_dt['agg_hand_vert'],
+                        pd_vert_reg=res_dt['hand_vert'],
+                        pd_vert_diff_final=res_dt['final_hand_vert'],
+                        pd_vert_diff_inprocess=res_dt['inprocess_hand_vert'],
+                        pd_vert_diff_mean=res_dt['mean_hand_vert'],
                         gt_obj_rt=batch['gt_obj_rt'],
+                        # pd_contact=res_dt['hand_contact'],
+                        # gt_contact=batch['gt_hand_contact'],
                         batch_idx=viz_i)
                     self.save_viz_obj(
                         rgb_path=batch['rgb_path'],
-                        pd_rt=res_dt['diff_final_obj_rt'],
+                        pd_rt=res_dt['obj_final_rt'],
                         gt_rt=batch['gt_obj_rt'],
-                        pd_rt_agg=res_dt['agg_obj_rt'],
-                        pd_inprocess_rt=res_dt['diff_inprocess_obj_rt'],
-                        pd_rt_reg=res_dt['reg_obj_rt'] if 'reg_obj_rt' in res_dt else None,
+                        pd_rt_mean=res_dt['obj_mean_rt'],
+                        pd_inprocess_rt=res_dt['obj_inprocess_rt'],
                         obj_name=batch['obj_name'],
                         gt_hand=batch['gt_hand_vert'],
                         batch_idx=viz_i)
@@ -318,10 +337,10 @@ class Trainer(BaseTrainer):
                             rgb_path=batch['rgb_path'],
                             pd_force_local=res_dt['force_local'],
                             gt_force_local=batch['force_local'],
-                            pd_hand_vert=res_dt['agg_hand_vert'],
+                            pd_hand_vert=res_dt['mean_hand_vert'],
                             gt_hand_vert=batch['gt_hand_vert_flip'],
                             obj_name=batch['obj_name'],
-                            pd_obj_rt=res_dt['agg_obj_rt'],
+                            pd_obj_rt=res_dt['obj_mean_rt'],
                             gt_obj_rt=batch['gt_obj_rt'],
                             gravity=batch['gravity'],
                             root_joint=batch['root_joint'],
@@ -332,6 +351,8 @@ class Trainer(BaseTrainer):
         # gather all gpus
         collector_hand = self.accel.gather_for_metrics(collector_hand, use_gather_object=True)
         collector_obj = self.accel.gather_for_metrics(collector_obj, use_gather_object=True)
+        # collector_force = self.accel.gather_for_metrics(collector_force, use_gather_object=True)
+        # collector_physics = self.accel.gather_for_metrics(collector_physics, use_gather_object=True)
         collector_res = self.accel.gather_for_metrics(collector_res, use_gather_object=True)
         if self.accel.is_main_process:
             mean_collector_hand, collector_hand = self.__collect_dict(collector_hand)
@@ -340,23 +361,29 @@ class Trainer(BaseTrainer):
             for k, v in mean_collector_hand.items():
                 df = pd.DataFrame(v)
                 df = df.map(lambda x: f"{1000*x:.2f}")
-                df = df.to_string()
                 info = f"{k}: \n{df}"
                 self.logger.info(info, main_process_only=True)
 
             mean_collector_obj, collector_obj = self.__collect_dict(collector_obj)
             mean_pose_df = obj_dt_to_dataframe(mean_collector_obj["mean_candidate_pose"])
-            mean_pose_df = mean_pose_df.to_string()
             info = f"Object Evaluation: {num_sample} samples \n"
             info += f"Mean Pose: \n{mean_pose_df}"
-
-            if mean_collector_obj['regression']:
-                reg_pose_df = obj_dt_to_dataframe(mean_collector_obj['regression'])
-                reg_pose_df = reg_pose_df.to_string()
-                info += f"\nRegression Pose: \n{reg_pose_df}"
             self.logger.info(info, main_process_only=True)
 
-    @torch.no_grad()
+            # mean_colloctor_force, collector_force = self.__collect_force_dt(collector_force)
+            # info += f"\nForce Evaluation: \n"
+            # for k, v in mean_colloctor_force.items():
+            #     info += f"{k}: {v:.2e} "
+
+            # if self.cfg.eval_physics:
+            #     phy_info = self.tester_physics.postprocess(collector_physics)
+            #     info = f"Physics Evaluation: \n"
+            #     info += f"{phy_info}"
+            #     self.logger.info(info, main_process_only=True)
+
+            with open(f"{self.save_dir}/my-prediction_align-{self.cfg.clean_data_mode}.pkl", "wb") as f:
+                pickle.dump(collector_res, f)
+
     def infer(self, epoch=""):
         self.accel.wait_for_everyone()
         self.model.eval()
@@ -368,46 +395,115 @@ class Trainer(BaseTrainer):
         for i, batch in enumerate(pbar):
             to_device(batch, self.device)
             self.accel.wait_for_everyone() 
-
             res_dt = self.model(batch, mode='predict')
             res_dt = self.postprocess(res_dt, batch['root_joint'], batch['is_right'])
             batch = self.postprocess(batch, batch['root_joint'])
             res_dt = to_numpy(res_dt)
             batch = to_numpy(batch)
+
+            # region [viz]
+            # j = 0
+            # k = self.accel.process_index
+            # n = self.accel.num_processes
+            # m = i * 32 * n + 32 * k + j
+            # save_dir = os.path.join(self.save_dir, 'viz_infer')
+            # os.makedirs(save_dir, exist_ok=True)
+
+            # crop_img = batch['rgb'][j].transpose(1, 2, 0)
+            # crop_img = inverse_normalize_rgb(crop_img)
+            # jt2d = project_pt3d_to_pt2d(res_dt['hand_joint'][j], batch['cam_intr_crop_flip'][j])
+            # img_jt2d = draw_pts_on_image(crop_img, jt2d, color=(0, 255, 0))
+            # root_joint2d = project_pt3d_to_pt2d(batch['root_joint'][j][None], batch['cam_intr_crop_flip'][j])
+            # img_jt2d = draw_pts_on_image(img_jt2d, root_joint2d, color=(0, 0, 255))
+            # save_path = os.path.join(save_dir, f"{m}_hand_pt2d_reg.jpg")
+            # cv2.imwrite(save_path, img_jt2d[..., ::-1])
+
+            # crop_img = batch['rgb'][j].transpose(1, 2, 0)
+            # crop_img = inverse_normalize_rgb(crop_img)
+            # jt2d = project_pt3d_to_pt2d(res_dt['mean_hand_joint'][j], batch['cam_intr_crop_flip'][j])
+            # img_jt2d = draw_pts_on_image(crop_img, jt2d, color=(0, 255, 0))
+            # root_joint2d = project_pt3d_to_pt2d(batch['root_joint'][j][None], batch['cam_intr_crop_flip'][j])
+            # img_jt2d = draw_pts_on_image(img_jt2d, root_joint2d, color=(0, 0, 255))
+            # save_path = os.path.join(save_dir, f"{m}_hand_pt2d_diff.jpg")
+            # cv2.imwrite(save_path, img_jt2d[..., ::-1])
+
+            # pd_hand_heatmap = res_dt['hand_heatmap'][j]
+            # batch['bbox_hand'] = batch['bbox_hand'][j].astype(np.int32)
+            # rgb_hand_crop = crop_img[batch['bbox_hand'][1]:batch['bbox_hand'][3], batch['bbox_hand'][0]:batch['bbox_hand'][2]]
+            # rgb_hand_crop = cv2.resize(rgb_hand_crop, (pd_hand_heatmap.shape[-2], pd_hand_heatmap.shape[-1]))
+            # pd_hand_viz_map = make_heatmaps(rgb_hand_crop[..., ::-1], pd_hand_heatmap)
+            # save_path = os.path.join(save_dir, f"{m}_hand_HM.jpg")
+            # cv2.imwrite(save_path, pd_hand_viz_map)
+
+            # pd_obj_heatmap = res_dt['obj_heatmap'][j]
+            # batch['bbox_obj_rect'] = batch['bbox_obj_rect'][j].astype(np.int32)
+            # rgb_obj_crop = crop_img[batch['bbox_obj_rect'][1]:batch['bbox_obj_rect'][3], batch['bbox_obj_rect'][0]:batch['bbox_obj_rect'][2]]
+            # rgb_obj_crop = cv2.resize(rgb_obj_crop, (pd_obj_heatmap.shape[-2], pd_obj_heatmap.shape[-1]))
+            # pd_obj_viz_map = make_heatmaps(rgb_obj_crop[..., ::-1], pd_obj_heatmap)
+            # gt_obj_heatmap = batch['hm_obj'][j]
+            # gt_obj_viz_map = make_heatmaps(rgb_obj_crop[..., ::-1], gt_obj_heatmap)
+            # obj_viz_map = np.concatenate([pd_obj_viz_map, gt_obj_viz_map], axis=0)
+            # save_path = os.path.join(save_dir, f"{i*32+j}_obj_HM.jpg")
+            # cv2.imwrite(save_path, obj_viz_map)
+
+            # obj_vert = YCB_MESHES[batch['obj_name'][j]]['verts_sampled']
+            # pd_obj_rt = res_dt['obj_mean_rt'][j]
+            # pd_obj_vert = obj_vert @ pd_obj_rt[:3, :3].T + pd_obj_rt[:3, 3]
+            # gt_obj_rt = batch['gt_obj_rt'][j]
+            # gt_obj_vert = obj_vert @ gt_obj_rt[:3, :3].T + gt_obj_rt[:3, 3]
+
+            # save_dt = {
+            #     'gt_obj_#000000': gt_obj_vert,
+            #     'pd_obj_#0000FF': pd_obj_vert,
+            #     'pd_hand_diff_#00FF00': res_dt['mean_hand_vert'][j],
+            #     'pd_hand_reg_#FF0000': res_dt['hand_vert'][j],
+            # }
+            # save_path = os.path.join(save_dir, f"{m}_vert.pkl")
+            # with open(save_path, 'wb') as f:
+            #     pickle.dump(save_dt, f)
+            # endregion
             
             phy_data_dt = {
                 'index': batch['index'],
                 'path': batch['rgb_path'],
-                'pd_obj_rt': res_dt['agg_obj_rt'],
-                # 'pd_obj_rt': res_dt['reg_obj_rt'],
-                'pd_hand_vert': res_dt['agg_hand_vert'].astype(np.float16),
-                'pd_hand_joint': res_dt['agg_hand_joint'],
+                'pd_obj_rt': res_dt['obj_mean_rt'],
+                'pd_hand_vert': res_dt['mean_hand_vert'].astype(np.float16),
+                'pd_hand_joint': res_dt['mean_hand_joint'],
             }
 
-            res_dt['reg_hand_joint'] = res_dt['reg_hand_joint'] @ OPENGL_TO_OPENCV
-            res_dt['reg_hand_vert'] = res_dt['reg_hand_vert'] @ OPENGL_TO_OPENCV
-            res_dt['agg_hand_joint'] = res_dt['agg_hand_joint'] @ OPENGL_TO_OPENCV
-            res_dt['agg_hand_vert'] = res_dt['agg_hand_vert'] @ OPENGL_TO_OPENCV
+            res_dt['hand_joint'] = res_dt['hand_joint'] @ OPENGL_TO_OPENCV
+            res_dt['hand_vert'] = res_dt['hand_vert'] @ OPENGL_TO_OPENCV
+            res_dt['mean_hand_joint'] = res_dt['mean_hand_joint'] @ OPENGL_TO_OPENCV
+            res_dt['mean_hand_vert'] = res_dt['mean_hand_vert'] @ OPENGL_TO_OPENCV
 
+            # tmp_rt = np.einsum("ij,bjk->bik", OPENGL_TO_OPENCV, res_dt['obj_mean_rt'])
+            # phy_data_dt = {
+            #     'index': batch['index'],
+            #     'path': batch['rgb_path'],
+            #     'pd_obj_rt': tmp_rt,
+            #     'pd_hand_vert': res_dt['mean_hand_vert'].astype(np.float16),
+            #     'pd_hand_joint': res_dt['mean_hand_joint'],
+            # }
             collector_res.append(phy_data_dt)
+
 
             for ind in range(len(batch['index'])):
                 eval_hand_dt = {
                     batch['index'][ind].item(): {
-                        'joint_reg': res_dt['reg_hand_joint'][ind],
-                        'vert_reg': res_dt['reg_hand_vert'][ind],
-                        'joint_diff': res_dt['agg_hand_joint'][ind],
-                        'vert_diff': res_dt['agg_hand_vert'][ind],
+                        'joint_reg': res_dt['hand_joint'][ind],
+                        'vert_reg': res_dt['hand_vert'][ind],
+                        'joint_diff': res_dt['mean_hand_joint'][ind],
+                        'vert_diff': res_dt['mean_hand_vert'][ind],
                     }
                 }
                 collector_hand.append(eval_hand_dt)
 
             eval_obj_dt = {
-                'pd_rt': res_dt['diff_final_obj_rt'],
+                'pd_rt': res_dt['obj_final_rt'],
                 'gt_rt': batch['gt_obj_rt'],
                 'cam_intr': batch['cam_intr'],
                 'obj_name': batch['obj_name'],
-                'pd_rt_agg': res_dt['agg_obj_rt'],
+                'pd_rt_mean': res_dt['obj_mean_rt'],
             }
             collector_obj.append(self.test_diff_object(eval_obj_dt, is_eval_best=False))
 
@@ -464,20 +560,26 @@ class Trainer(BaseTrainer):
 
         # evaluate one candidate
         eval_1_dt = copy(eval_dt)
-        eval_1_dt['pd_joint'] = eval_1_dt['pd_joint_diff_final'][:, 0]
-        eval_1_dt['pd_vert'] = eval_1_dt['pd_vert_diff_final'][:, 0]
+        eval_1_dt['pd_joint'] = eval_1_dt['pd_joint_diff'][:, 0]
+        eval_1_dt['pd_vert'] = eval_1_dt['pd_vert_diff'][:, 0]
         out_1_dt = self.tester_hand(eval_1_dt)
 
-        eval_agg_mano_dt = copy(eval_reg_dt)
-        eval_agg_mano_dt['pd_joint'] = eval_dt['pd_joint_diff_agg']
-        eval_agg_mano_dt['pd_vert'] = eval_dt['pd_vert_diff_agg']
-        out_agg_mano_dt = self.tester_hand(eval_agg_mano_dt)
+        # evaluate the mean of all candidates, deprecated
+        # eval_mean_joint_dt = copy(eval_1_dt)
+        # eval_mean_joint_dt['pd_joint'] = eval_dt['pd_joint_diff'].mean(1)
+        # eval_mean_joint_dt['pd_vert'] = eval_dt['pd_vert_diff'].mean(1)
+        # out_mean_joint_dt = self.tester_hand(eval_mean_joint_dt)
+
+        eval_mean_mano_dt = copy(eval_reg_dt)
+        eval_mean_mano_dt['pd_joint'] = eval_dt['pd_joint_diff_mean']
+        eval_mean_mano_dt['pd_vert'] = eval_dt['pd_vert_diff_mean']
+        out_mean_mano_dt = self.tester_hand(eval_mean_mano_dt)
         
         # evaluate the best candidate
         if is_eval_best:
             eval_best_dt = copy(eval_dt)
-            eval_best_dt['pd_joint_diff_final'] = eval_dt['pd_joint_diff_final']
-            eval_best_dt['pd_vert_diff_final'] = eval_dt['pd_vert_diff_final']
+            eval_best_dt['pd_joint_diff'] = eval_dt['pd_joint_diff']
+            eval_best_dt['pd_vert_diff'] = eval_dt['pd_vert_diff']
             out_best_dt = self.tester_hand(eval_best_dt)
         else:
             out_best_dt = {}
@@ -485,7 +587,7 @@ class Trainer(BaseTrainer):
             'regression': out_reg_dt,
             'one_candidate': out_1_dt,
             # 'mean_candidate_joint': out_mean_joint_dt,
-            'agg_candidate': out_agg_mano_dt,
+            'mean_candidate_mano': out_mean_mano_dt,
             # 'best_candidate': out_best_dt,
         }
 
@@ -495,31 +597,32 @@ class Trainer(BaseTrainer):
         eval_1_dt['pd_rt'] = eval_1_dt['pd_rt'][:, 0]
         out_1_dt = self.tester_obj(eval_1_dt)
 
+        # evaluate the mean vert of all candidates, deprecated
+        # all_pd_rt = torch.from_numpy(eval_dt['pd_rt']).float()
+        # mean_pd_r = matrix_to_rotation_6d(all_pd_rt[..., :3, :3]).mean(1)
+        # mean_pd_r = rotation_6d_to_matrix(mean_pd_r)
+        # mean_pd_t = all_pd_rt[..., :3, 3].mean(1)
+        # mean_pd_rt = torch.cat([mean_pd_r, mean_pd_t[:, :, None]], dim=-1)
+        # eval_mean_vert_dt = deepcopy(eval_1_dt)
+        # eval_mean_vert_dt['pd_rt'] = mean_pd_rt.numpy()
+        # out_mean_vert_dt = self.tester_obj(eval_mean_vert_dt)
+
         # evaluate the mean pose of all candidates
         eval_mean_pose_dt = deepcopy(eval_dt)
-        eval_mean_pose_dt['pd_rt'] = eval_dt['pd_rt_agg']
+        eval_mean_pose_dt['pd_rt'] = eval_dt['pd_rt_mean']
         out_mean_pose_dt = self.tester_obj(eval_mean_pose_dt)
 
         # evaluate the best candidate
         if is_eval_best:
-            out_best_dt = self.tester_obj(eval_dt)
+            out_dt = self.tester_obj(eval_dt)
         else:
-            out_best_dt = {}
-
-        # evaluate regression
-        if 'pd_rt_reg' in eval_dt:
-            eval_reg = deepcopy(eval_dt)
-            eval_reg['pd_rt'] = eval_dt['pd_rt_reg']
-            out_reg_dt = self.tester_obj(eval_reg)
-        else:
-            out_reg_dt = {}
+            out_dt = {}
 
         return {
             'one_candidate': out_1_dt,
             # 'mean_candidate_vert': out_mean_vert_dt,
             'mean_candidate_pose': out_mean_pose_dt,
-            'best_candidate_pose': out_best_dt,
-            'regression': out_reg_dt,
+            'best_candidate_pose': out_dt,
         }
 
     def __pprint_dict(self, dt):
@@ -577,14 +680,13 @@ class Trainer(BaseTrainer):
 
     def postprocess(self, data, root_joint, is_right=None):
         for k in list(data.keys()):
-            if k in ['diff_inprocess_obj_6d', 'diff_final_obj_6d', 'gt_obj', 'agg_obj_6d', 'reg_obj_6d']:
-                new_k = k.replace('_6d', '')
-                data[f'{new_k}_rt'] = self.__postprocess_obj_rt(data[k], root_joint)
+            if k in ['obj_inprocess', 'obj_final', 'gt_obj', 'obj_mean']:
+                data[f'{k}_rt'] = self.__postprocess_obj_rt(data[k], root_joint)
 
         for k, v in data.items():
-            if k in ['reg_hand_vert', 'reg_hand_joint', 'diff_final_hand_vert', 'diff_final_hand_joint', 'agg_hand_vert', 'agg_hand_joint']:
+            if k in ['hand_vert', 'hand_joint', 'final_hand_vert', 'final_hand_joint', 'mean_hand_vert', 'mean_hand_joint']:
                 data[k] = self.__postprocess_hand_vert(v, root_joint, is_right)
-            elif k in ['diff_inprocess_hand_vert', 'diff_inprocess_hand_joint']:
+            elif k in ['inprocess_hand_vert', 'inprocess_hand_joint']:
                 _is_right = torch.zeros(v.shape[0], dtype=torch.bool, device=v.device) + is_right[0]
                 _root_joint = torch.zeros([v.shape[0], root_joint.shape[-1]], device=v.device) + root_joint[0]
                 data[k] = self.__postprocess_hand_vert(v, _root_joint, _is_right)
@@ -609,22 +711,30 @@ class Trainer(BaseTrainer):
         gt_rt = data['gt_rt'][j]
         pd_rt = data['pd_rt'][j]
         pd_inprocess_rt = data['pd_inprocess_rt'][j]
-        pd_rt_agg = data['pd_rt_agg'][j]
-        pd_rt_reg = data['pd_rt_reg'][j] if data['pd_rt_reg'] is not None else None
+        pd_rt_mean = data['pd_rt_mean'][j]
 
         gt_vert = obj_vert @ gt_rt[:3, :3].T + gt_rt[:3, 3]
         pd_vert = np.einsum("ni,...ij->...nj", obj_vert, pd_rt[..., :3, :3].swapaxes(-1, -2)) + pd_rt[..., 3][:, None]
         inprocess_vert = np.einsum("ni,...ij->...nj", obj_vert, pd_inprocess_rt[0, ..., :3, :3].swapaxes(-1, -2)) + pd_inprocess_rt[0, ..., 3][:, None]
-        pd_vert_mean = obj_vert @ pd_rt_agg[:3, :3].T + pd_rt_agg[:3, 3]
-        pd_vert_reg = obj_vert @ pd_rt_reg[:3, :3].T + pd_rt_reg[:3, 3] if pd_rt_reg is not None else None
+        pd_vert_mean = obj_vert @ pd_rt_mean[:3, :3].T + pd_rt_mean[:3, 3]
         
         obj_name = data['obj_name'][j]
         gt_hand = data['gt_hand'][j]
         rgb_path = data['rgb_path'][j]
+
+        # inprocess_dt = {'rgb_path': rgb_path, 'obj_name': obj_name, 'gt_hand_#000000': gt_hand, 'obj_gt_vert_#00FF00': gt_vert}
+        # for s in range(inprocess_vert.shape[0]):
+        #     if s % 10 == 0:
+        #         color = get_random_color(is_HEX=True, exclude=np.array([0, 255, 0]))
+        #         inprocess_dt[f'obj_inprocess_vert_{s}_{color}'] = inprocess_vert[s]
+
+        # save_path = os.path.join(self.save_dir, f"viz/{k}_obj_inprocess.pkl")
+        # os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        # with open(save_path, 'wb') as f:
+        #     pickle.dump(inprocess_dt, f)
         
         multihyperthesis_dt = {'rgb_path': rgb_path, 'obj_name': obj_name, 'gt_hand_#000000': gt_hand, 
-                               'obj_gt_vert_#00FF00': gt_vert, 'obj_pd_vert_mean_#FF0000': pd_vert_mean,
-                                'obj_pd_vert_reg_#00FFFF': pd_vert_reg}
+                               'obj_gt_vert_#00FF00': gt_vert, 'obj_pd_vert_mean_#FF0000': pd_vert_mean}
         for s in range(min(pd_vert.shape[0], 20)):
             color = get_random_color(is_HEX=True, exclude=np.array([0, 255, 0]))
             multihyperthesis_dt[f'obj_diff_vert_{s}_{color}'] = pd_vert[s]
@@ -646,21 +756,36 @@ class Trainer(BaseTrainer):
         pd_vert_reg = data['pd_vert_reg'][j]
         pd_vert_diff = data['pd_vert_diff_final'][j]
         pd_vert_diff_inprocess = data['pd_vert_diff_inprocess']
-        pd_vert_diff_agg = data['pd_vert_diff_agg'][j]
+        pd_vert_diff_mean = data['pd_vert_diff_mean'][j]
 
         reg_dt = {'rgb_path': rgb_path, 'gt_hand_#000000': gt_vert, 'gt_obj_#00FF00': gt_obj_vert, 
-                  'pd_vert_reg_#00FF00': pd_vert_reg, 'pd_vert_diff_agg_#FF0000': pd_vert_diff_agg}
+                  'pd_vert_reg_#00FF00': pd_vert_reg, 'pd_vert_diff_mean_#FF0000': pd_vert_diff_mean}
         save_path = os.path.join(self.save_dir, f"viz/{k}_hand_reg_&_diff_mean.pkl")
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, 'wb') as f: pickle.dump(reg_dt, f)
 
+        # inprocess_dt = {'rgb_path': rgb_path, 'gt_hand_#000000': gt_vert, 'gt_obj_#00FF00': gt_obj_vert, 'pd_vert_reg_#00FF00': pd_vert_reg}
+        # for s in range(pd_vert_diff_inprocess.shape[0]):
+        #     color = get_random_color(is_HEX=True, exclude=np.array([0, 255, 0]))
+        #     inprocess_dt[f'hand_inprocess_vert_{s}_{color}'] = pd_vert_diff_inprocess[s]
+        # save_path = os.path.join(self.save_dir, f"viz/{k}_hand_inprocess.pkl")
+        # with open(save_path, 'wb') as f: pickle.dump(inprocess_dt, f)
+
         multi_hyperthesis_dt = {'rgb_path': rgb_path, 'gt_hand_#000000': gt_vert, 'gt_obj_#00FF00': gt_obj_vert, 
-                                'pd_vert_reg_#00FF00': pd_vert_reg, 'pd_vert_diff_agg_#FF0000': pd_vert_diff_agg}
+                                'pd_vert_reg_#00FF00': pd_vert_reg, 'pd_vert_diff_mean_#FF0000': pd_vert_diff_mean}
         for s in range(min(pd_vert_diff.shape[0], 20)):
             color = get_random_color(is_HEX=True, exclude=np.array([0, 255, 0]))
             multi_hyperthesis_dt[f'hand_diff_vert_{s}_{color}'] = pd_vert_diff[s]
         save_path = os.path.join(self.save_dir, f"viz/{k}_hand_multihyperthesis.pkl")
         with open(save_path, 'wb') as f: pickle.dump(multi_hyperthesis_dt, f)
+
+        # gt_hand_color = np.array([0, 255, 0]) * data['gt_contact'][j][:778, None] # TODO: show all 1080 hand points
+        # pd_hand_color = np.array([0, 0, 255]) * data['pd_contact'][j][:778, None]
+        # gt_colorred_hand = np.concatenate([gt_vert, gt_hand_color], axis=-1)
+        # pd_colorred_hand = np.concatenate([gt_vert, pd_hand_color], axis=-1)
+        # contact_dt = {'rgb_path': rgb_path, 'gt_contact': gt_colorred_hand, 'pd_contact': pd_colorred_hand, 'gt_obj_#00FF00': gt_obj_vert}    
+        # save_path = os.path.join(self.save_dir, f"viz/{k}_hand_contact.pkl")
+        # with open(save_path, 'wb') as f: pickle.dump(contact_dt, f)
 
     def save_viz_heatmap(self, batch_idx, **data):
         i = self.cfg.eval_batch_size * batch_idx
@@ -761,99 +886,16 @@ class Trainer(BaseTrainer):
         force_dt = {
             'gt_obj_vert_#00FF00': gt_obj_vert, 
             'pd_obj_vert_#FF0000': pd_obj_vert, 
-            'gt_force_line_#00FF00': gt_force,       
-            'pd_force_line_#FF0000': pd_force, 
+            'gt_force_#00FF00': gt_force,       
+            'pd_force_#FF0000': pd_force, 
             'gt_hand_vert_#000000': gt_hand_vert, 
             'pd_hand_vert_#FF00FF': pd_hand_vert,
-            'gt_gravity_line_#00FF00': gt_gravity,
-            'pd_gravity_line_#FF0000': pd_gravity,
+            'gt_gravity_#00FF00': gt_gravity,
+            'pd_gravity_#FF0000': pd_gravity,
         }
         save_path = os.path.join(self.save_dir, f"viz/{k}_force.pkl")
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, 'wb') as f: pickle.dump(force_dt, f)
-
-    def save_viz_mesh_force(self, batch_idx, **data):
-        i = self.cfg.eval_batch_size * batch_idx
-        j = 0
-        k = i*(self.accel.num_processes) + self.accel.process_index + j
-
-        # obj_vert = YCB_MESHES[data['obj_name'][j]]["verts_sampled"]
-        obj_vert = np.array(YCB_MESHES[data['obj_name'][j]]["verts"])
-        obj_face = np.array(YCB_MESHES[data['obj_name'][j]]["faces"])
-        obj_CoM = np.array(YCB_MESHES[data['obj_name'][j]]["CoM"])
-        gt_obj_rt = data['gt_obj_rt'][j]
-        pd_obj_rt = data['pd_obj_rt'][j]
-        root_joint = data['root_joint'][j]
-
-        gt_obj_vert = obj_vert @ gt_obj_rt[:3, :3].T + gt_obj_rt[:3, 3] - root_joint
-        pd_obj_vert = obj_vert @ pd_obj_rt[:3, :3].T + pd_obj_rt[:3, 3] - root_joint
-        gt_obj_CoM = obj_CoM @ gt_obj_rt[:3, :3].T + gt_obj_rt[:3, 3] - root_joint
-        pd_obj_CoM = obj_CoM @ pd_obj_rt[:3, :3].T + pd_obj_rt[:3, 3] - root_joint
-
-        gt_hand_vert = data['gt_hand_vert'][j]
-        pd_hand_vert = data['pd_hand_vert'][j] - root_joint
-        hand_face = mano_layer_r.th_faces.clone().cpu().numpy()
-
-        gravity = data['gravity'][j]
-
-        gt_force_local = data['gt_force_local'][j]
-        pd_force_local = data['pd_force_local'][j]
-
-        if not data['is_right'][j]:
-            gt_obj_vert[..., 0] = -gt_obj_vert[..., 0]
-            pd_obj_vert[..., 0] = -pd_obj_vert[..., 0]
-            gravity[..., 0] = -gravity[..., 0]
-            pd_hand_vert[..., 0] = -pd_hand_vert[..., 0]
-            gt_obj_CoM[..., 0] = -gt_obj_CoM[..., 0]
-            pd_obj_CoM[..., 0] = -pd_obj_CoM[..., 0]
-        
-        gt_force_point, gt_force_global = from_local_to_global(gt_force_local, gt_hand_vert)
-        pd_force_point, pd_force_global = from_local_to_global(pd_force_local, pd_hand_vert)
-
-        gt_force = np.stack([gt_force_point, gt_force_point + gt_force_global*0.1], axis=1)
-        pd_force = np.stack([pd_force_point, pd_force_point + pd_force_global*0.1], axis=1)
-
-        gt_gravity = np.stack([gt_obj_CoM[None], gt_obj_CoM + gravity*0.1], axis=1)
-        pd_gravity = np.stack([pd_obj_CoM[None], pd_obj_CoM + gravity*0.1], axis=1)
-
-        rgb_path = data['rgb_path'][j]
-        rgb = cv2.imread(rgb_path)
-
-        K = data['K'][j]
-        root = data['root_joint_flip'][j]
-        
-        gt_obj_mesh = {
-            'vertex': gt_obj_vert + root,
-            'face': obj_face,
-        }
-        pd_obj_mesh = {
-            'vertex': pd_obj_vert + root,
-            'face': obj_face,
-        }
-        pd_hand_mesh = {
-            'vertex': pd_hand_vert + root,
-            'face': hand_face,
-        }
-        gt_hand_mesh = {
-            'vertex': gt_hand_vert + root,
-            'face': hand_face,
-        }
-
-        force_dt = {
-            'gt_mesh': gt_obj_mesh,
-            'pd_mesh': pd_obj_mesh,
-            'gt_force_line_#00FF00': gt_force + root,       
-            'pd_force_line_#FF0000': pd_force + root, 
-            'gt_hand_mesh': gt_hand_mesh,
-            'pd_hand_mesh': pd_hand_mesh,
-            'gt_gravity_line_#00FF00': gt_gravity + root,
-            'pd_gravity_line_#FF0000': pd_gravity + root,
-            'K': K,
-        }
-        save_path = os.path.join(self.save_dir, f"viz/{k}_force.pkl")
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, 'wb') as f: pickle.dump(force_dt, f)
-        cv2.imwrite(os.path.join(self.save_dir, f"viz/{k}_rgb.jpg"), rgb)
 
 def obj_dt_to_dataframe(obj_dt):
     for k, v in obj_dt.items():
@@ -878,35 +920,3 @@ def dump(pred_out_path, xyz_pred_list, verts_pred_list):
     with open(pred_out_path, 'w') as fo:
         json.dump([xyz_pred_list, verts_pred_list], fo)
     print('Dumped %d joints and %d verts predictions to %s' % (len(xyz_pred_list), len(verts_pred_list), pred_out_path))
-
-
-import torch
-import torch.nn as nn
-from thop import profile
-from copy import deepcopy
-
-def compute_flops(model, batch):
-    # if in ddp mode, return None
-    if torch.distributed.is_initialized():
-        return None
-    
-    example_input = {}
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            example_input[k] = v[[0]].cuda()
-        else:
-            example_input[k] = [v[0]]
-    class WrappedModel(nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = deepcopy(model).cuda().eval() 
-        def forward(self, x):
-            return self.model(x, mode='predict') 
-
-    wrapped_model = WrappedModel(model)
-
-    flops, params = profile(wrapped_model, inputs=(example_input,), verbose=False)
-
-    print(f"FLOPs: {flops / 1e9:.2f} GFLOPs")
-    print(f"Params: {params / 1e6:.2f} M")
-

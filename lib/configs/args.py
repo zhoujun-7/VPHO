@@ -100,23 +100,12 @@ class Config:
         self.weight_point_loss = 1.0
         self.weight_CoM_loss = 1.0
         self.weight_joint2hm_loss = 1.0
-        self.weight_obj_reg_vert_loss = 1.0
-        self.weight_obj_reg_kpt_loss = 1.0
-        self.weight_obj_reg_rot6d_loss = 1.0
-        self.weight_obj_reg_trans_loss = 1.0
 
         #* sample
         self.sample_T0 = 0.55
         self.sample_num = 50
         self.topk_hand = 10
         self.topk_obj = 5
-
-        #* aggregation
-        self.do_weighted_average = True
-        self.do_physics_selection = True
-        self.aggregation_mode_hand = 'heatmap_cascade'
-        self.aggregation_mode_obj = 'heatmap_cascade'
-        self.use_regression_as_candidate = True
 
 def get_args():
     parser = argparse.ArgumentParser(description='Hand-Object Pose Estimation')
@@ -125,6 +114,8 @@ def get_args():
     parser.add_argument('--eval_full', action='store_true')
     parser.add_argument('--eval_path', type=str, default='')
     parser.add_argument('--mark', type=str, default='')
+    # parser.add_argument('--eval_physics', action='store_true')
+    # parser.add_argument('--eval_with_simulator', action='store_true')
 
     #* training
     parser.add_argument('--random_seed', type=int, default=0)
@@ -147,12 +138,8 @@ def get_args():
     
     #* dataset
     parser.add_argument('--dataset_name', type=str, default='dexycb', choices=['dexycb', 'ho3d'])
-    parser.add_argument('--data_dir', type=str, default='/root/Workspace/HOI/data/DexYCB')
-    parser.add_argument('--clean_data_mode', type=str, default='2023_CVPR_HFL', choices=['2023_CVPR_HFL', 
-                                                                                         '2022_CVPR_ArtiBoost', 
-                                                                                         '2023_WACV_DMA', 
-                                                                                         'stable_grasping', 
-                                                                                         '2023_NIPS_DeepSimHO'])
+    parser.add_argument('--data_dir', type=str, default='/home/jun/Projects/HandPoseEstimation/DexYCB')
+    parser.add_argument('--clean_data_mode', type=str, default='2023_CVPR_HFL', choices=['2023_CVPR_HFL', '2022_CVPR_ArtiBoost', '2023_WACV_DMA', 'stable_grasping', '2023_NIPS_DeepSimHO'])
     parser.add_argument('--bbox_scale_factor', type=float, default=1.2)
     parser.add_argument('--patch_size', type=int, default=256)
     parser.add_argument('--batch_size', type=int, default=64)
@@ -186,8 +173,13 @@ def get_args():
     parser.add_argument('--random_erasing_max_count', type=float, default=1)
 
     #* model
-    parser.add_argument('--model',  type=str, default='vpho_net',
-                        choices=['vpho_net',])
+    parser.add_argument('--model',  type=str, default='DiffHandObj'  ,
+                        choices=['DiffHandObj', 
+                                 'DiffHandObj_RegForce', 
+                                 'DiffHandObj_MultiBBox', 
+                                 'DiffHandObj_MultiBBox_HM128',
+                                 'DiffHandObj_BBox_Force',
+                                 ])
     parser.add_argument('--sde_mode', type=str, choices=['edm', 've', 'vp', 'subvp'], default='ve')
     parser.add_argument('--repeat_num', type=int, default=20)
     parser.add_argument('--sampler', type=str, choices=['ode'], default='ode')
@@ -217,33 +209,17 @@ def get_args():
     parser.add_argument('--weight_point_loss', type=float, default=1e2)
     parser.add_argument('--weight_CoM_loss', type=float, default=1e2)
     parser.add_argument('--weight_joint2hm_loss', type=float, default=1e3)
-    parser.add_argument('--weight_obj_reg_vert_loss', type=float, default=1e4)
-    parser.add_argument('--weight_obj_reg_kpt_loss', type=float, default=1e4)
-    parser.add_argument('--weight_obj_reg_rot6d_loss', type=float, default=10)
-    parser.add_argument('--weight_obj_reg_trans_loss', type=float, default=1e4)
-
 
     #* sample
-    parser.add_argument('--sample_T0', type=float, default=0.65)
+    # parser.add_argument('--sample_T0', type=float, default=0.65)
+    parser.add_argument('--sample_T0', type=float, default=0.55)
     parser.add_argument('--sample_num', type=int, default=50)
+    # parser.add_argument('--topk_hand', type=float, default=0.3)
+    # parser.add_argument('--topk_obj', type=float, default=0.1)
     parser.add_argument('--topk_hand', type=int, default=15)
     parser.add_argument('--topk_obj', type=int, default=5)
 
-    #* aggregation
-    parser.add_argument('--do_weighted_average', action='store_false')
-    parser.add_argument('--do_physics_selection', action='store_false')
-    parser.add_argument('--aggregation_mode_hand', type=str, default='heatmap_cascade', choices=['heatmap_cascade', 
-                                                                                                 'heatmap', 
-                                                                                                 '2D_pt_pose', 
-                                                                                                 '2D_pt_joint',
-                                                                                                 'average_all',
-                                                                                                 'random'])
-    parser.add_argument('--aggregation_mode_obj', type=str, default='heatmap_cascade', choices=['heatmap_cascade', 
-                                                                                                'heatmap', 
-                                                                                                '2D_pt_pose',
-                                                                                                'average_all',
-                                                                                                'random'])
-    parser.add_argument('--use_regression_as_candidate', action='store_false')
+
 
     args = parser.parse_args()
     return args
