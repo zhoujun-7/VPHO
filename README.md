@@ -2,6 +2,26 @@
 
 Official repository for the AAAI 2026 paper [**VPHO: Joint Visual-Physical Cue Learning and Aggregation for Hand-Object Pose Estimation**](https://ojs.aaai.org/index.php/AAAI/article/view/38375)
 
+## Update
+We have refactored the project to improve its publishability. However, we found that the refactoring slightly reduces training performance (evaluation performance remains unaffected).
+
+If you wish to reproduce the training process, we recommend using the code in the ```reproduce``` branch. This code is less organized but more reliable for training.
+```
+# After cloning the project and installing the conda environment
+git switch reproduce
+
+# for single GPU
+accelerate launch --config_file lib/configs/single.yaml     \ 
+    main.py     \
+    --mode train     \
+    --model DiffHandObj_BBox_Force     \
+    --mark DexYCB-HBBox-Force    \
+    --batch_size 64  \
+    --bbox_scale_factor 1.2 \
+    --random_seed 206
+    --gradient_accumulation_steps 2
+```
+
 ## Overview
 
 VPHO is a method for hand-object pose estimation that jointly learns and aggregates visual and physical cues. This repository contains the implementation code and pseudo force data.
