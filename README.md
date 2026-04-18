@@ -5,7 +5,7 @@ Official repository for the AAAI 2026 paper [**VPHO: Joint Visual-Physical Cue L
 ## Update
 We have refactored the project to improve its publishability. However, we found that the refactoring slightly reduces training performance (evaluation performance remains unaffected).
 
-If you wish to reproduce the training process, we recommend using the code in the ```reproduce``` branch. This code is less organized but more reliable for training.
+If you want to reproduce the training process, we recommend using the code in the ```reproduce``` branch. This code is less organized but more reliable for training.
 ```
 # After cloning the project and installing the conda environment
 git switch reproduce
